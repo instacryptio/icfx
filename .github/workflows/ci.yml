@@ -1,0 +1,37 @@
+name: CI
+
+# Gate merges into main: build, vet, and test on every PR. Also runnable by hand
+# (workflow_dispatch) — e.g. a manual sanity run before cutting a release tag.
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # Uses the version from the `go` directive in go.mod (currently 1.26.6).
+          go-version-file: go.mod
+          cache: true
+
+      # cgo hardware backends need their C libs: hardware/chalresp uses
+      # `pkg-config: ykpers-1`, hardware/fido2 uses keys-pub/go-libfido2 (libfido2).
+      # Without these, `go build ./...` fails compiling those packages.
+      - name: Install native deps
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libykpers-1-dev libfido2-dev
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # Unit tests only. Integration tests are behind `//go:build integration`
+      # (they need a live Postgres/ic-cloud) and are intentionally not run here.
+      - name: Test
+        run: go test ./...
