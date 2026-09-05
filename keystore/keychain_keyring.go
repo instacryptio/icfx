@@ -1,4 +1,4 @@
-//go:build linux
+//go:build !darwin
 
 package keystore
 
@@ -11,7 +11,14 @@ import (
 	"github.com/zalando/go-keyring"
 )
 
-// KeychainStore stores keys in the OS keychain via go-keyring (D-Bus Secret Service).
+// KeychainStore stores keys in the OS keychain via go-keyring, which is pure Go
+// (no cgo) and self-dispatches per platform: D-Bus Secret Service on Linux and
+// the BSDs (OpenBSD/NetBSD unconditionally; FreeBSD/DragonFly when cgo is on),
+// the Credential Manager (wincred) on Windows, and a graceful
+// ErrUnsupportedPlatform fallback everywhere else. On platforms with no live
+// backend, KeychainAvailable() returns false and callers fall back to the
+// encrypted file store — so this one file safely covers every non-macOS target.
+// macOS uses the native Security.framework via keychain_darwin.go instead.
 type KeychainStore struct{}
 
 // NewKeychainStore creates a new KeychainStore.
