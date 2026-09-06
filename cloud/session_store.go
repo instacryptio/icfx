@@ -255,7 +255,8 @@ func (s fileTokenBackend) SaveTokens(email string, t *Tokens) error {
 	if err != nil {
 		return err
 	}
-	ct, err := crypto.EncryptWithPassphrase(raw, pass)
+	defer crypto.Zero(pass)
+	ct, err := crypto.EncryptWithPassphraseBytes(raw, pass)
 	if err != nil {
 		return fmt.Errorf("encrypting session tokens: %w", err)
 	}
@@ -277,7 +278,8 @@ func (s fileTokenBackend) LoadTokens(email string) (*Tokens, error) {
 	if err != nil {
 		return nil, err
 	}
-	raw, err := crypto.DecryptWithPassphrase(ct, pass)
+	defer crypto.Zero(pass)
+	raw, err := crypto.DecryptWithPassphraseBytes(ct, pass)
 	if err != nil {
 		return nil, fmt.Errorf("decrypting session tokens (wrong keystore passphrase?): %w", err)
 	}

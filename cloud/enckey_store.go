@@ -106,7 +106,8 @@ func (s fileEncKeyStore) Save(email string, encKey []byte) error {
 	if err != nil {
 		return err
 	}
-	ct, err := crypto.EncryptWithPassphrase(encKey, pass)
+	defer crypto.Zero(pass)
+	ct, err := crypto.EncryptWithPassphraseBytes(encKey, pass)
 	if err != nil {
 		return fmt.Errorf("encrypting cloud key: %w", err)
 	}
@@ -128,7 +129,8 @@ func (s fileEncKeyStore) Load(email string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	key, err := crypto.DecryptWithPassphrase(ct, pass)
+	defer crypto.Zero(pass)
+	key, err := crypto.DecryptWithPassphraseBytes(ct, pass)
 	if err != nil {
 		return nil, fmt.Errorf("decrypting cloud key (wrong keystore passphrase?): %w", err)
 	}

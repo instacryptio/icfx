@@ -14,10 +14,12 @@ import (
 	"github.com/instacryptio/icfx/profile"
 )
 
-const (
-	testKSPass     = "keystore-at-rest-pass"
-	testExportPass = "cloud-enc-key-passphrase"
-)
+const testKSPass = "keystore-at-rest-pass"
+
+// testExportPass returns a FRESH copy of the roaming outer-key each call: the
+// export/import/peek functions now take ownership of the []byte and wipe it, so
+// a shared slice reused across calls would be zeroed after the first.
+func testExportPass() []byte { return []byte("cloud-enc-key-passphrase") }
 
 // useEnv points the global icfx dirs at an isolated temp tree (a "device") and
 // returns an encrypted file keystore rooted there.
@@ -33,7 +35,7 @@ func useEnv(t *testing.T, dir string) *keystore.FileStore {
 	if err != nil {
 		t.Fatalf("KeysDir: %v", err)
 	}
-	return keystore.NewEncryptedFileStoreWithDir(keysDir, func() (string, error) { return testKSPass, nil })
+	return keystore.NewEncryptedFileStoreWithDir(keysDir, func() ([]byte, error) { return []byte(testKSPass), nil })
 }
 
 // createLocalIdentity mirrors `icc identity create`: generate a keypair, store
@@ -156,7 +158,7 @@ func TestExportImportIdentitiesRoaming(t *testing.T) {
 	kpAlice := createLocalIdentity(t, ksA, "alice")
 	kpBob := createLocalIdentity(t, ksA, "bob")
 
-	blob, err := profile.ExportIdentitiesToBytes(testExportPass, fileExportFn(t))
+	blob, err := profile.ExportIdentitiesToBytes(testExportPass(), fileExportFn(t))
 	if err != nil {
 		t.Fatalf("ExportIdentitiesToBytes: %v", err)
 	}
@@ -174,7 +176,7 @@ func TestExportImportIdentitiesRoaming(t *testing.T) {
 	createLocalIdentity(t, ksB, "carol")
 	createLocalIdentity(t, ksB, "bob") // will be upserted to device A's bob
 
-	if err := profile.ImportIdentitiesFromBytes(blob, testExportPass, fileImportFn(t)); err != nil {
+	if err := profile.ImportIdentitiesFromBytes(blob, testExportPass(), fileImportFn(t)); err != nil {
 		t.Fatalf("ImportIdentitiesFromBytes: %v", err)
 	}
 

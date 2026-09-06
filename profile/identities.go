@@ -90,10 +90,11 @@ func RoamingDigest(exportFn IdentityExportFn) (string, error) {
 // ExportIdentitiesToBytes packs every local identity's at-rest transport form
 // (via exportFn) into a bundle wrapped under outerKey. It does NOT decrypt
 // file/HW keys — export is prompt-free; the secret is needed only to *use* a key.
-func ExportIdentitiesToBytes(outerKey string, exportFn IdentityExportFn) ([]byte, error) {
-	if outerKey == "" {
+func ExportIdentitiesToBytes(outerKey []byte, exportFn IdentityExportFn) ([]byte, error) {
+	if len(outerKey) == 0 {
 		return nil, fmt.Errorf("outer key cannot be empty")
 	}
+	defer crypto.Zero(outerKey)
 	if exportFn == nil {
 		return nil, fmt.Errorf("exportFn callback is required")
 	}
@@ -167,7 +168,7 @@ func ExportIdentitiesToBytes(outerKey string, exportFn IdentityExportFn) ([]byte
 	if err := gw.Close(); err != nil {
 		return nil, fmt.Errorf("closing gzip: %w", err)
 	}
-	return crypto.EncryptWithPassphrase(buf.Bytes(), outerKey)
+	return crypto.EncryptWithPassphraseBytes(buf.Bytes(), outerKey)
 }
 
 // ImportIdentitiesFromBytes unwraps the bundle with outerKey and MERGES each
@@ -180,11 +181,12 @@ func ExportIdentitiesToBytes(outerKey string, exportFn IdentityExportFn) ([]byte
 // before the roam applies it. A wrong-default device can still read this (the
 // blob is encKey-wrapped, not self-locked), which is what makes cross-device
 // convergence work.
-func PeekRoamingManifest(data []byte, outerKey string) (Manifest, error) {
-	if outerKey == "" {
+func PeekRoamingManifest(data []byte, outerKey []byte) (Manifest, error) {
+	if len(outerKey) == 0 {
 		return Manifest{}, fmt.Errorf("outer key cannot be empty")
 	}
-	plain, err := crypto.DecryptWithPassphrase(data, outerKey)
+	defer crypto.Zero(outerKey)
+	plain, err := crypto.DecryptWithPassphraseBytes(data, outerKey)
 	if err != nil {
 		return Manifest{}, fmt.Errorf("decrypting identities bundle (wrong cloud password?): %w", err)
 	}
@@ -203,15 +205,16 @@ func PeekRoamingManifest(data []byte, outerKey string) (Manifest, error) {
 	return manifest, nil
 }
 
-func ImportIdentitiesFromBytes(data []byte, outerKey string, importFn IdentityImportFn) error {
-	if outerKey == "" {
+func ImportIdentitiesFromBytes(data []byte, outerKey []byte, importFn IdentityImportFn) error {
+	if len(outerKey) == 0 {
 		return fmt.Errorf("outer key cannot be empty")
 	}
 	if importFn == nil {
 		return fmt.Errorf("importFn callback is required")
 	}
+	defer crypto.Zero(outerKey)
 
-	plain, err := crypto.DecryptWithPassphrase(data, outerKey)
+	plain, err := crypto.DecryptWithPassphraseBytes(data, outerKey)
 	if err != nil {
 		return fmt.Errorf("decrypting identities bundle (wrong cloud password?): %w", err)
 	}

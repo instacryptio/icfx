@@ -7,7 +7,7 @@ import (
 
 func TestFileEncKeyStoreRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	store := NewFileEncKeyStore(dir, func() (string, error) { return "keystore-pass", nil })
+	store := NewFileEncKeyStore(dir, func() ([]byte, error) { return []byte("keystore-pass"), nil })
 
 	key := []byte("0123456789abcdef0123456789abcdef")
 	if err := store.Save("alice@example.com", key); err != nil {
@@ -40,11 +40,11 @@ func TestFileEncKeyStoreRoundTrip(t *testing.T) {
 
 func TestFileEncKeyStoreWrongPassphrase(t *testing.T) {
 	dir := t.TempDir()
-	saver := NewFileEncKeyStore(dir, func() (string, error) { return "right-pass", nil })
+	saver := NewFileEncKeyStore(dir, func() ([]byte, error) { return []byte("right-pass"), nil })
 	if err := saver.Save("a@b.c", []byte("secret-key-material")); err != nil {
 		t.Fatal(err)
 	}
-	loader := NewFileEncKeyStore(dir, func() (string, error) { return "wrong-pass", nil })
+	loader := NewFileEncKeyStore(dir, func() ([]byte, error) { return []byte("wrong-pass"), nil })
 	if _, err := loader.Load("a@b.c"); err == nil {
 		t.Fatal("wrong passphrase must fail to decrypt")
 	}

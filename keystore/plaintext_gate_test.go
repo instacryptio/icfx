@@ -14,7 +14,7 @@ func TestEncryptedStore_RejectsPlaintextByDefault(t *testing.T) {
 		t.Fatalf("seed plaintext key: %v", err)
 	}
 
-	enc := NewEncryptedFileStoreWithDir(dir, func() (string, error) { return "pw", nil })
+	enc := NewEncryptedFileStoreWithDir(dir, func() ([]byte, error) { return []byte("pw"), nil })
 	// No AllowPlaintextMigration() → must reject.
 	if _, err := enc.LoadEncryptionIdentity("test"); err == nil {
 		t.Fatal("encrypted-mode store loaded a plaintext key without opting into migration; want rejection")
