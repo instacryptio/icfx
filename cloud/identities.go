@@ -9,11 +9,14 @@ import (
 	"github.com/instacryptio/icfx/profile"
 )
 
-// encKeyPassphrase renders the raw account encryption key as the passphrase
-// string profile export/import expect. The key is already high-entropy (the
-// scrypt pass is redundant but harmless), matching the profile-bundle pattern.
-func encKeyPassphrase(encKey []byte) string {
-	return base64.StdEncoding.EncodeToString(encKey)
+// encKeyPassphrase renders the raw account encryption key as the wipeable
+// passphrase bytes profile export/import expect. The base64 encoding (its
+// ASCII bytes, not the raw key) is the on-the-wire passphrase and MUST be
+// preserved for ciphertext compatibility with existing roaming blobs. The
+// callee (profile) takes ownership of the returned slice and zeroes it. The key
+// is already high-entropy (the scrypt pass is redundant but harmless).
+func encKeyPassphrase(encKey []byte) []byte {
+	return []byte(base64.StdEncoding.EncodeToString(encKey))
 }
 
 // sessionOrStoredEncKey resolves the account encryption key: the in-memory

@@ -22,14 +22,28 @@ import (
 	"github.com/instacryptio/icfx/identity/handoff"
 )
 
-// fakeHost implements handoff.Host. With c == nil only ClearKeys is invoked.
-type fakeHost struct{ cleared []string }
+// fakeHost implements handoff.Host. With c == nil the cloud re-key path is
+// skipped, so the delete flow reaches exactly two host methods: OpenIdentity
+// (the unlock-to-delete gate) and ClearKeys (the delete primitive). openErr
+// simulates a victim that can't be unlocked (lost/wrong key); cleared records
+// the full index entry ClearKeys received.
+type fakeHost struct {
+	cleared []identity.IdentityIndex
+	opened  []string
+	openErr error
+}
 
-func (h *fakeHost) OpenIdentity(string) (cloud.SelfCrypter, error) { return nil, nil }
-func (h *fakeHost) ClearKeys(name string) error                    { h.cleared = append(h.cleared, name); return nil }
-func (h *fakeHost) GroupStore() (*groups.Store, error)             { return nil, nil }
-func (h *fakeHost) NotificationStore() *cloud.NotificationStore    { return nil }
-func (h *fakeHost) ResourceIO() cloud.ResourceIO                   { return nil }
+func (h *fakeHost) OpenIdentity(name string) (cloud.SelfCrypter, error) {
+	h.opened = append(h.opened, name)
+	return nil, h.openErr
+}
+func (h *fakeHost) ClearKeys(idx identity.IdentityIndex) error {
+	h.cleared = append(h.cleared, idx)
+	return nil
+}
+func (h *fakeHost) GroupStore() (*groups.Store, error)          { return nil, nil }
+func (h *fakeHost) NotificationStore() *cloud.NotificationStore { return nil }
+func (h *fakeHost) ResourceIO() cloud.ResourceIO                { return nil }
 
 // useEnv points the global icfx dirs at an isolated temp tree.
 func useEnv(t *testing.T, dir string) {
@@ -120,7 +134,7 @@ func TestHandoffAndDelete_LastIdentityForced(t *testing.T) {
 	if err := handoff.HandoffAndDelete(context.Background(), nil, cfg, "alice", "", h, true); err != nil {
 		t.Fatalf("forced last-identity delete: %v", err)
 	}
-	if len(h.cleared) != 1 || h.cleared[0] != "alice" {
+	if len(h.cleared) != 1 || h.cleared[0].Name != "alice" {
 		t.Errorf("cleared = %v, want [alice]", h.cleared)
 	}
 	if indexNames(t)["alice"] || len(indexNames(t)) != 0 {
@@ -157,8 +171,12 @@ func TestHandoffAndDelete_NonDefaultDeletes(t *testing.T) {
 	if err := handoff.HandoffAndDelete(context.Background(), nil, cfg, "bob", "", h, false); err != nil {
 		t.Fatalf("delete non-default: %v", err)
 	}
-	if len(h.cleared) != 1 || h.cleared[0] != "bob" {
+	if len(h.cleared) != 1 || h.cleared[0].Name != "bob" {
 		t.Errorf("cleared = %v, want [bob]", h.cleared)
+	}
+	// ClearKeys must receive the resolved index entry (backend/HW), not just a name.
+	if h.cleared[0].Backend != identity.BackendFile {
+		t.Errorf("ClearKeys got backend %q, want %q from the resolved entry", h.cleared[0].Backend, identity.BackendFile)
 	}
 	names := indexNames(t)
 	if names["bob"] || !names["alice"] || len(names) != 1 {
@@ -181,7 +199,7 @@ func TestHandoffAndDelete_DefaultWithSuccessor(t *testing.T) {
 	if cfg.DefaultIdentity != "bob" {
 		t.Errorf("default = %q, want bob", cfg.DefaultIdentity)
 	}
-	if len(h.cleared) != 1 || h.cleared[0] != "alice" {
+	if len(h.cleared) != 1 || h.cleared[0].Name != "alice" {
 		t.Errorf("cleared = %v, want [alice]", h.cleared)
 	}
 	names := indexNames(t)
@@ -211,6 +229,43 @@ func TestHandoffAndDelete_VictimNotFound(t *testing.T) {
 	seedIdentity(t, "bob")
 	if err := handoff.HandoffAndDelete(context.Background(), nil, defaultCfg("alice"), "ghost", "", &fakeHost{}, false); err == nil {
 		t.Error("expected error for a victim that doesn't exist")
+	}
+}
+
+func TestHandoffAndDelete_UnlockGateBlocks(t *testing.T) {
+	useEnv(t, t.TempDir())
+	seedIdentity(t, "alice")
+	seedIdentity(t, "bob")
+	// bob is non-default, so the successor path is skipped and the delete goes
+	// straight to the unlock gate. A victim that can't be unlocked aborts.
+	h := &fakeHost{openErr: errors.New("no hardware key / wrong passphrase")}
+	err := handoff.HandoffAndDelete(context.Background(), nil, defaultCfg("alice"), "bob", "", h, false)
+	if err == nil {
+		t.Fatal("expected delete to abort when the victim can't be unlocked")
+	}
+	if len(h.cleared) != 0 {
+		t.Errorf("keys cleared despite the unlock gate failing: %v", h.cleared)
+	}
+	if !indexNames(t)["bob"] {
+		t.Error("bob was removed from the index despite the unlock gate failing")
+	}
+}
+
+func TestHandoffAndDelete_ForceDoesNotSkipUnlockGate(t *testing.T) {
+	useEnv(t, t.TempDir())
+	seedIdentity(t, "alice")
+	// Only identity + force bypasses the last-identity block, but the unlock gate
+	// still applies — force must never be a hardware-key bypass.
+	h := &fakeHost{openErr: errors.New("locked")}
+	err := handoff.HandoffAndDelete(context.Background(), nil, defaultCfg("alice"), "alice", "", h, true)
+	if err == nil {
+		t.Fatal("expected forced delete to still require unlocking the victim")
+	}
+	if len(h.opened) == 0 {
+		t.Error("the unlock gate was not invoked on a forced delete")
+	}
+	if len(h.cleared) != 0 || !indexNames(t)["alice"] {
+		t.Error("forced delete proceeded despite the unlock gate failing")
 	}
 }
 

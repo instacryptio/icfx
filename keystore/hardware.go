@@ -168,37 +168,49 @@ func (d *HardwareKeyDecorator) loadOrCreateChallengeLocked(name string) ([]byte,
 
 // derivePassphrase computes the age-scrypt passphrase used to encrypt this
 // identity's stored bytes: hex(HKDF-SHA256(passphrase, hwResponse)).
-func (d *HardwareKeyDecorator) derivePassphrase(name string) (string, error) {
+//
+// It returns the hex-encoded KEK as a FRESH, caller-owned []byte (never a Go
+// string) so the derived per-identity secret can be wiped after use; every
+// caller MUST crypto.Zero the result. The master passphrase, the hardware
+// response, and the raw KEK are all wiped here, keeping their lifetimes as
+// short as possible. The hex encoding (not the raw KEK) is preserved as the
+// scrypt passphrase for on-disk compatibility with keystores written before
+// this change.
+func (d *HardwareKeyDecorator) derivePassphrase(name string) ([]byte, error) {
 	if d.passFn == nil {
-		return "", fmt.Errorf("hardware decorator requires a passphrase function")
+		return nil, fmt.Errorf("hardware decorator requires a passphrase function")
 	}
 
 	d.mu.Lock()
 	challenge, err := d.loadOrCreateChallengeLocked(name)
 	d.mu.Unlock()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	pass, err := d.passFn()
 	if err != nil {
-		return "", fmt.Errorf("getting passphrase: %w", err)
+		return nil, fmt.Errorf("getting passphrase: %w", err)
 	}
+	defer crypto.Zero(pass)
 
 	response, err := d.hwKey.Challenge(challenge)
 	if err != nil {
-		return "", fmt.Errorf("hardware challenge-response (%s): %w", d.hwKey.Type(), err)
+		return nil, fmt.Errorf("hardware challenge-response (%s): %w", d.hwKey.Type(), err)
 	}
 	defer crypto.Zero(response)
 
-	kek, err := crypto.DeriveHardwareKEK(pass, response)
+	kek, err := crypto.DeriveHardwareKEKBytes(pass, response)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer crypto.Zero(kek)
-	// NOTE: the returned hex string can't be zeroed (Go strings are immutable);
-	// the underlying KEK bytes are wiped here, minimizing the secret's lifetime.
-	return hex.EncodeToString(kek), nil
+
+	// Hex-encode into a []byte (not hex.EncodeToString, which would create an
+	// un-zeroable string); this hex passphrase is what the caller wipes.
+	hexKEK := make([]byte, hex.EncodedLen(len(kek)))
+	hex.Encode(hexKEK, kek)
+	return hexKEK, nil
 }
 
 // StoreEncryptionIdentity encrypts the given age secret key string with the
@@ -209,7 +221,8 @@ func (d *HardwareKeyDecorator) StoreEncryptionIdentity(name string, identity str
 	if err != nil {
 		return err
 	}
-	ciphertext, err := crypto.EncryptWithPassphrase([]byte(identity), pass)
+	defer crypto.Zero(pass)
+	ciphertext, err := crypto.EncryptWithPassphraseBytes([]byte(identity), pass)
 	if err != nil {
 		return fmt.Errorf("encrypting encryption identity: %w", err)
 	}
@@ -231,7 +244,8 @@ func (d *HardwareKeyDecorator) LoadEncryptionIdentity(name string) (string, erro
 	if err != nil {
 		return "", err
 	}
-	plaintext, err := crypto.DecryptWithPassphrase(ciphertext, pass)
+	defer crypto.Zero(pass)
+	plaintext, err := crypto.DecryptWithPassphraseBytes(ciphertext, pass)
 	if err != nil {
 		return "", fmt.Errorf("decrypting encryption identity (wrong passphrase or hardware key?): %w", err)
 	}
@@ -245,7 +259,8 @@ func (d *HardwareKeyDecorator) StoreSigningKey(name string, key []byte) error {
 	if err != nil {
 		return err
 	}
-	ciphertext, err := crypto.EncryptWithPassphrase(key, pass)
+	defer crypto.Zero(pass)
+	ciphertext, err := crypto.EncryptWithPassphraseBytes(key, pass)
 	if err != nil {
 		return fmt.Errorf("encrypting signing key: %w", err)
 	}
@@ -262,7 +277,8 @@ func (d *HardwareKeyDecorator) LoadSigningKey(name string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	plaintext, err := crypto.DecryptWithPassphrase(ciphertext, pass)
+	defer crypto.Zero(pass)
+	plaintext, err := crypto.DecryptWithPassphraseBytes(ciphertext, pass)
 	if err != nil {
 		return nil, fmt.Errorf("decrypting signing key (wrong passphrase or hardware key?): %w", err)
 	}

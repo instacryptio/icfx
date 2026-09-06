@@ -26,8 +26,11 @@ type Host interface {
 	// identities may prompt a tap). The host owns its lifecycle.
 	OpenIdentity(name string) (cloud.SelfCrypter, error)
 	// ClearKeys wipes an identity's key material (and HW challenge) from the
-	// keystore — the backend/HW-aware part the client already implements.
-	ClearKeys(name string) error
+	// keystore. It receives the already-resolved index entry (backend/HW config)
+	// and MUST NOT re-read the identity index: HandoffAndDelete removes the entry
+	// from the index BEFORE calling this (crash-safety ordering), so a re-read
+	// would not find it. Only the keystore construction is the client's job.
+	ClearKeys(idx identity.IdentityIndex) error
 	GroupStore() (*groups.Store, error)
 	NotificationStore() *cloud.NotificationStore // nil when the client has no drawer (ic-cli)
 	ResourceIO() cloud.ResourceIO
@@ -122,16 +125,36 @@ func HandoffAndDelete(ctx context.Context, c *cloud.Client, cfg *config.Config, 
 	// The reverse partial — index removed, keys still present — is the
 	// recoverable "orphaned keys" state (`import --reconcile`), a strictly
 	// better failure mode.
+	// Authorization gate: you may only delete an identity you can currently
+	// unlock — proving control before destroying it. For a HW identity this
+	// forces a challenge-response touch; for a passphrase identity, its
+	// passphrase; a plain keychain identity opens silently. Placed after the
+	// successor/re-key resolution so the successor-required and invalid-successor
+	// paths return WITHOUT a wasted touch; for a default-with-cloud delete the
+	// re-key above already opened the victim, so the host's cached challenge
+	// response makes this a no-op (no double touch). --force does NOT skip this —
+	// it only bypasses the last-identity/cloud-abandonment block; skipping the
+	// unlock would turn --force into a free hardware-key bypass. A key that can't
+	// be unlocked (lost/corrupted) has no CLI delete path by design — remove it
+	// manually.
+	if _, err := host.OpenIdentity(victim); err != nil {
+		return fmt.Errorf("cannot delete %q — unlock it first (touch your hardware key / enter its passphrase): %w", victim, err)
+	}
+
+	var victimIdx identity.IdentityIndex
 	filtered := make([]identity.IdentityIndex, 0, len(entries)-1)
 	for _, e := range entries {
-		if e.Name != victim {
-			filtered = append(filtered, e)
+		if e.Name == victim {
+			victimIdx = e
+			continue
 		}
+		filtered = append(filtered, e)
 	}
 	if err := idStore.SaveIndex(filtered); err != nil {
 		return fmt.Errorf("saving identity index: %w", err)
 	}
-	if err := host.ClearKeys(victim); err != nil {
+	// Pass the captured entry — the index no longer has it (SaveIndex above).
+	if err := host.ClearKeys(victimIdx); err != nil {
 		return fmt.Errorf("clearing keys for %q: %w", victim, err)
 	}
 	if err := idStore.RemoveMeta(victim); err != nil {

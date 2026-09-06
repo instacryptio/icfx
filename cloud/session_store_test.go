@@ -17,7 +17,7 @@ func testTokens() *Tokens {
 
 func TestFileSessionStoreTokenRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	store := DefaultSessionStore(dir, false, func() (string, error) { return "keystore-pass", nil }, nil)
+	store := DefaultSessionStore(dir, false, func() ([]byte, error) { return []byte("keystore-pass"), nil }, nil)
 
 	if store.HasSession("alice@example.com") {
 		t.Fatal("no session should exist yet")
@@ -59,11 +59,11 @@ func TestFileSessionStoreTokenRoundTrip(t *testing.T) {
 
 func TestFileSessionStoreWrongPassphrase(t *testing.T) {
 	dir := t.TempDir()
-	saver := DefaultSessionStore(dir, false, func() (string, error) { return "right", nil }, nil)
+	saver := DefaultSessionStore(dir, false, func() ([]byte, error) { return []byte("right"), nil }, nil)
 	if err := saver.SaveTokens("a@b.c", testTokens()); err != nil {
 		t.Fatal(err)
 	}
-	loader := DefaultSessionStore(dir, false, func() (string, error) { return "wrong", nil }, nil)
+	loader := DefaultSessionStore(dir, false, func() ([]byte, error) { return []byte("wrong"), nil }, nil)
 	// Wrong passphrase can't decrypt the tokens...
 	if _, err := loader.LoadTokens("a@b.c"); err == nil {
 		t.Fatal("wrong passphrase must fail to decrypt tokens")
@@ -77,8 +77,8 @@ func TestFileSessionStoreWrongPassphrase(t *testing.T) {
 func TestSessionStorePositionsAreNotSecret(t *testing.T) {
 	dir := t.TempDir()
 	// Deliberately give a failing passFn: positions must be readable WITHOUT it.
-	store := DefaultSessionStore(dir, false, func() (string, error) {
-		return "", errors.New("locked")
+	store := DefaultSessionStore(dir, false, func() ([]byte, error) {
+		return nil, errors.New("locked")
 	}, nil)
 
 	pos := SyncPositions{
@@ -107,7 +107,7 @@ func TestSessionStorePositionsAreNotSecret(t *testing.T) {
 
 func TestClientSessionStoreAutoPersistAndRestore(t *testing.T) {
 	dir := t.TempDir()
-	store := DefaultSessionStore(dir, false, func() (string, error) { return "kp", nil }, nil)
+	store := DefaultSessionStore(dir, false, func() ([]byte, error) { return []byte("kp"), nil }, nil)
 
 	// A client that "logs in": email + SetTokens should auto-persist.
 	c, _ := New("http://localhost:0")

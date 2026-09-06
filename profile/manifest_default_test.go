@@ -34,13 +34,13 @@ func TestManifestRoundTripsDefaultAndFingerprint(t *testing.T) {
 		t.Fatalf("cfg.Save: %v", err)
 	}
 
-	blob, err := profile.ExportIdentitiesToBytes(testExportPass, fileExportFn(t))
+	blob, err := profile.ExportIdentitiesToBytes(testExportPass(), fileExportFn(t))
 	if err != nil {
 		t.Fatalf("ExportIdentitiesToBytes: %v", err)
 	}
 
 	// PeekRoamingManifest reads the pointer + fingerprints with NO key import.
-	m, err := profile.PeekRoamingManifest(blob, testExportPass)
+	m, err := profile.PeekRoamingManifest(blob, testExportPass())
 	if err != nil {
 		t.Fatalf("PeekRoamingManifest: %v", err)
 	}
@@ -61,7 +61,7 @@ func TestManifestRoundTripsDefaultAndFingerprint(t *testing.T) {
 	// Device B (clean): import populates the local index Fingerprint from the
 	// manifest (identities.go), so B's key-swap gate has a value to compare.
 	useEnv(t, t.TempDir())
-	if err := profile.ImportIdentitiesFromBytes(blob, testExportPass, fileImportFn(t)); err != nil {
+	if err := profile.ImportIdentitiesFromBytes(blob, testExportPass(), fileImportFn(t)); err != nil {
 		t.Fatalf("ImportIdentitiesFromBytes: %v", err)
 	}
 	store, err := identity.NewStore()

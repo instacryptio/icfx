@@ -105,12 +105,14 @@ type RoamingImportOptions struct {
 	// PromptExisting is called to obtain the ORIGIN passphrase of a
 	// passphrase-protected key that must be decrypted to move into this device's
 	// keychain. Required only when DestBackend is keychain and a passphrase key
-	// is imported; may be nil otherwise.
-	PromptExisting func(name string) (string, error)
+	// is imported; may be nil otherwise. It returns the passphrase as a wipeable
+	// []byte; the callee takes ownership and zeroes it after use.
+	PromptExisting func(name string) ([]byte, error)
 	// PromptNew is called to obtain a FRESH passphrase to protect a raw key that
 	// lands on a file device. Required only when DestBackend is file and a raw
-	// (cloud) key is imported; may be nil otherwise.
-	PromptNew func(name string) (string, error)
+	// (cloud) key is imported; may be nil otherwise. It returns the passphrase as
+	// a wipeable []byte; the callee takes ownership and zeroes it after use.
+	PromptNew func(name string) ([]byte, error)
 	// Notify optionally receives human-readable info messages (e.g. "set a
 	// passphrase to protect this key at rest"). Nil discards them.
 	Notify func(msg string)
@@ -211,11 +213,12 @@ func decryptWithPrompt(opts RoamingImportOptions, name string, enc, sign []byte)
 	if err != nil {
 		return nil, nil, err
 	}
-	encPlain, err = crypto.DecryptWithPassphrase(enc, pass)
+	defer crypto.Zero(pass)
+	encPlain, err = crypto.DecryptWithPassphraseBytes(enc, pass)
 	if err != nil {
 		return nil, nil, fmt.Errorf("decrypting %q (wrong passphrase?): %w", name, err)
 	}
-	signPlain, err = crypto.DecryptWithPassphrase(sign, pass)
+	signPlain, err = crypto.DecryptWithPassphraseBytes(sign, pass)
 	if err != nil {
 		return nil, nil, fmt.Errorf("decrypting %q (wrong passphrase?): %w", name, err)
 	}
@@ -236,11 +239,12 @@ func encryptRawToFile(opts RoamingImportOptions, name string, enc, sign []byte) 
 	if err != nil {
 		return err
 	}
-	encCt, err := crypto.EncryptWithPassphrase(enc, pass)
+	defer crypto.Zero(pass)
+	encCt, err := crypto.EncryptWithPassphraseBytes(enc, pass)
 	if err != nil {
 		return err
 	}
-	signCt, err := crypto.EncryptWithPassphrase(sign, pass)
+	signCt, err := crypto.EncryptWithPassphraseBytes(sign, pass)
 	if err != nil {
 		return err
 	}

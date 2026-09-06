@@ -266,7 +266,7 @@ func makeHWUnlocked(t *testing.T, name, passphrase string, hwSecret []byte) (*id
 	}
 	dir := t.TempDir()
 	hw := &stubHardwareKey{secret: hwSecret}
-	passFn := func() (string, error) { return passphrase, nil }
+	passFn := func() ([]byte, error) { return []byte(passphrase), nil }
 	dec := keystore.NewHardwareKeyDecorator(newMemKeystore(), hw, dir, passFn)
 
 	if err := dec.StoreEncryptionIdentity(name, kp.EncryptionIdentity); err != nil {
@@ -306,7 +306,7 @@ func TestExportImport_PreservesHW(t *testing.T) {
 	dstKS := newMemKeystore()
 	dstDir := t.TempDir()
 	dstHW := &stubHardwareKey{secret: hwSecret} // same secret = same device class
-	dstPass := func() (string, error) { return "user-pass", nil }
+	dstPass := func() ([]byte, error) { return []byte("user-pass"), nil }
 
 	var dstDec *keystore.HardwareKeyDecorator
 	imported, err := identity.Import(bundle, "export-pass", dstKS, func(challenge []byte) (keystore.Keystore, error) {

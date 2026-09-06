@@ -42,7 +42,7 @@ func TestHardwareKeyDecorator_RoundTrip(t *testing.T) {
 	hwSecret := []byte("device-secret-12345678901")
 	hw := newMockHardwareKey(hwSecret)
 
-	passFn := func() (string, error) { return "user-passphrase", nil }
+	passFn := func() ([]byte, error) { return []byte("user-passphrase"), nil }
 	dec := NewHardwareKeyDecorator(NewFileStoreWithDir(dir), hw, dir, passFn)
 
 	identity := "AGE-SECRET-KEY-PQ-1FAKEFAKEFAKE"
@@ -66,7 +66,7 @@ func TestHardwareKeyDecorator_RoundTrip(t *testing.T) {
 func TestHardwareKeyDecorator_SigningKeyRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	hw := newMockHardwareKey([]byte("hw-secret"))
-	passFn := func() (string, error) { return "pass", nil }
+	passFn := func() ([]byte, error) { return []byte("pass"), nil }
 	dec := NewHardwareKeyDecorator(NewFileStoreWithDir(dir), hw, dir, passFn)
 
 	signKey := []byte{0xde, 0xad, 0xbe, 0xef, 0x12, 0x34, 0x56, 0x78}
@@ -85,7 +85,7 @@ func TestHardwareKeyDecorator_SigningKeyRoundTrip(t *testing.T) {
 func TestHardwareKeyDecorator_DifferentDeviceFails(t *testing.T) {
 	dir := t.TempDir()
 	hw1 := newMockHardwareKey([]byte("device-A-secret"))
-	passFn := func() (string, error) { return "samepass", nil }
+	passFn := func() ([]byte, error) { return []byte("samepass"), nil }
 
 	dec1 := NewHardwareKeyDecorator(NewFileStoreWithDir(dir), hw1, dir, passFn)
 	if err := dec1.StoreEncryptionIdentity("alice", "AGE-SECRET-KEY-PQ-1XYZ"); err != nil {
@@ -104,13 +104,13 @@ func TestHardwareKeyDecorator_WrongPassphraseFails(t *testing.T) {
 	dir := t.TempDir()
 	hw := newMockHardwareKey([]byte("hw-secret"))
 
-	passOK := func() (string, error) { return "right-pass", nil }
+	passOK := func() ([]byte, error) { return []byte("right-pass"), nil }
 	dec1 := NewHardwareKeyDecorator(NewFileStoreWithDir(dir), hw, dir, passOK)
 	if err := dec1.StoreEncryptionIdentity("alice", "AGE-SECRET-KEY-PQ-1XYZ"); err != nil {
 		t.Fatalf("StoreEncryptionIdentity: %v", err)
 	}
 
-	passWrong := func() (string, error) { return "wrong-pass", nil }
+	passWrong := func() ([]byte, error) { return []byte("wrong-pass"), nil }
 	dec2 := NewHardwareKeyDecorator(NewFileStoreWithDir(dir), hw, dir, passWrong)
 	_, err := dec2.LoadEncryptionIdentity("alice")
 	if err == nil {
@@ -121,7 +121,7 @@ func TestHardwareKeyDecorator_WrongPassphraseFails(t *testing.T) {
 func TestHardwareKeyDecorator_ChallengePersistsAcrossOps(t *testing.T) {
 	dir := t.TempDir()
 	hw := newMockHardwareKey([]byte("secret"))
-	passFn := func() (string, error) { return "pass", nil }
+	passFn := func() ([]byte, error) { return []byte("pass"), nil }
 
 	dec := NewHardwareKeyDecorator(NewFileStoreWithDir(dir), hw, dir, passFn)
 	if err := dec.StoreEncryptionIdentity("alice", "id-1"); err != nil {
@@ -154,7 +154,7 @@ func TestHardwareKeyDecorator_ChallengePersistsAcrossOps(t *testing.T) {
 func TestHardwareKeyDecorator_DistinctChallengesPerIdentity(t *testing.T) {
 	dir := t.TempDir()
 	hw := newMockHardwareKey([]byte("secret"))
-	passFn := func() (string, error) { return "pass", nil }
+	passFn := func() ([]byte, error) { return []byte("pass"), nil }
 	dec := NewHardwareKeyDecorator(NewFileStoreWithDir(dir), hw, dir, passFn)
 
 	if err := dec.StoreEncryptionIdentity("alice", "id-alice"); err != nil {
@@ -197,7 +197,7 @@ func TestHardwareKeyDecorator_DistinctChallengesPerIdentity(t *testing.T) {
 func TestHardwareKeyDecorator_RemoveChallenge(t *testing.T) {
 	dir := t.TempDir()
 	hw := newMockHardwareKey([]byte("secret"))
-	passFn := func() (string, error) { return "pass", nil }
+	passFn := func() ([]byte, error) { return []byte("pass"), nil }
 	dec := NewHardwareKeyDecorator(NewFileStoreWithDir(dir), hw, dir, passFn)
 
 	if err := dec.StoreEncryptionIdentity("alice", "id-1"); err != nil {
@@ -223,7 +223,7 @@ func TestHardwareKeyDecorator_RemoveChallenge(t *testing.T) {
 func TestHardwareKeyDecorator_ListNamesFiltersChallengeFiles(t *testing.T) {
 	dir := t.TempDir()
 	hw := newMockHardwareKey([]byte("secret"))
-	passFn := func() (string, error) { return "pass", nil }
+	passFn := func() ([]byte, error) { return []byte("pass"), nil }
 	dec := NewHardwareKeyDecorator(NewFileStoreWithDir(dir), hw, dir, passFn)
 
 	if err := dec.StoreEncryptionIdentity("alice", "id-1"); err != nil {
@@ -326,7 +326,7 @@ var _ Keystore = (*memKeystore)(nil)
 func TestHardwareKeyDecorator_KeychainShapedInner(t *testing.T) {
 	challengeDir := t.TempDir() // challenge file always lives on disk
 	hw := newMockHardwareKey([]byte("hw-secret"))
-	passFn := func() (string, error) { return "user-pass", nil }
+	passFn := func() ([]byte, error) { return []byte("user-pass"), nil }
 	inner := newMemKeystore()
 	dec := NewHardwareKeyDecorator(inner, hw, challengeDir, passFn)
 
@@ -371,7 +371,7 @@ func TestHardwareKeyDecorator_KeychainShapedInner(t *testing.T) {
 func TestHardwareKeyDecorator_ChallengeProviderInterface(t *testing.T) {
 	dir := t.TempDir()
 	hw := newMockHardwareKey([]byte("secret"))
-	passFn := func() (string, error) { return "pass", nil }
+	passFn := func() ([]byte, error) { return []byte("pass"), nil }
 	dec := NewHardwareKeyDecorator(NewFileStoreWithDir(dir), hw, dir, passFn)
 
 	var p HWChallengeProvider = dec // compile-time interface check
@@ -387,7 +387,7 @@ func TestHardwareKeyDecorator_ChallengeProviderInterface(t *testing.T) {
 func TestHardwareKeyDecorator_EnsureChallenge(t *testing.T) {
 	dir := t.TempDir()
 	hw := newMockHardwareKey([]byte("secret"))
-	passFn := func() (string, error) { return "pass", nil }
+	passFn := func() ([]byte, error) { return []byte("pass"), nil }
 	dec := NewHardwareKeyDecorator(NewFileStoreWithDir(dir), hw, dir, passFn)
 
 	c1, err := dec.EnsureChallenge("alice")

@@ -152,7 +152,7 @@ func Import(inputPath string, opts ImportOptions, destKsFn DestinationKeystoreFn
 }
 
 // ImportFromBytes is Import but takes the encrypted bytes directly.
-func ImportFromBytes(data []byte, opts ImportOptions, destKsFn DestinationKeystoreFn) error {
+func ImportFromBytes(data []byte, opts ImportOptions, destKsFn DestinationKeystoreFn) (err error) {
 	pass := opts.PassphraseBytes
 	if len(pass) == 0 {
 		pass = []byte(opts.Passphrase)
@@ -188,6 +188,26 @@ func ImportFromBytes(data []byte, opts ImportOptions, destKsFn DestinationKeysto
 	if manifest.Version != bundleVersion {
 		return fmt.Errorf("unsupported bundle version %d (this build supports %d)", manifest.Version, bundleVersion)
 	}
+
+	// Everything above is non-destructive (pre-validation). Before the first
+	// destructive write, snapshot the existing install so ANY failure in the
+	// steps below rolls back to the user's previous profile. Without this, a
+	// mid-import error (bad destKsFn, a HW ceremony that fails, a disk error on
+	// identity N of M) leaves the keys already wiped and the profile
+	// half-installed, with NO recovery — permanent key loss.
+	backup, berr := snapshotInstall()
+	if berr != nil {
+		return fmt.Errorf("backing up the existing profile before import: %w", berr)
+	}
+	defer func() {
+		if err != nil {
+			if rerr := backup.restore(); rerr != nil {
+				err = fmt.Errorf("%w; the previous profile could NOT be fully restored (%v) — your original data is preserved at %s", err, rerr, backup.root)
+				return
+			}
+		}
+		backup.discard()
+	}()
 
 	// Step 1: apply config first so destKsFn / KeysDir / etc. observe the
 	// imported preferences during the rest of the import.
@@ -290,6 +310,195 @@ func ImportFromBytes(data []byte, opts ImportOptions, destKsFn DestinationKeysto
 		}
 	}
 
+	return nil
+}
+
+// installBackup is a rollback snapshot of the on-disk identity install, taken
+// before ImportFromBytes's destructive phase so a failed import can restore the
+// user's previous profile instead of leaving wiped keys and a half-install.
+// It captures exactly what the import overwrites: the keys dir, the per-identity
+// meta dir, identities.json, contacts.json, and config.toml.
+type installBackup struct {
+	root  string        // temp dir holding the archived copies
+	items []backupEntry // one per install path, in restore order
+}
+
+// backupEntry records one live path and its archived copy. existed=false means
+// the live path was absent at snapshot time, so restore removes it (undoing any
+// file the partial import created).
+type backupEntry struct {
+	live    string // absolute live path, resolved BEFORE any config/path mutation
+	stored  string // archived copy under root (unset when existed=false)
+	isDir   bool
+	existed bool
+}
+
+// snapshotInstall archives the current install into a fresh temp dir. Paths are
+// resolved up front (before applyImportedConfig can change KeysDir/DataDir) so
+// restore always targets the original locations.
+func snapshotInstall() (*installBackup, error) {
+	keysDir, err := config.KeysDir()
+	if err != nil {
+		return nil, fmt.Errorf("resolving keys dir: %w", err)
+	}
+	metaDir, err := config.IdentityMetaDir()
+	if err != nil {
+		return nil, fmt.Errorf("resolving identity meta dir: %w", err)
+	}
+	idxPath, err := config.IdentitiesFilePath()
+	if err != nil {
+		return nil, fmt.Errorf("resolving identities path: %w", err)
+	}
+	contactsPath, err := config.ContactsFilePath()
+	if err != nil {
+		return nil, fmt.Errorf("resolving contacts path: %w", err)
+	}
+	cfgPath, err := config.ConfigFilePath()
+	if err != nil {
+		return nil, fmt.Errorf("resolving config path: %w", err)
+	}
+
+	if err := os.MkdirAll(config.TempDir(), 0o700); err != nil {
+		return nil, fmt.Errorf("creating temp dir: %w", err)
+	}
+	root, err := os.MkdirTemp(config.TempDir(), "icfx-import-rollback-")
+	if err != nil {
+		return nil, fmt.Errorf("creating rollback dir: %w", err)
+	}
+
+	b := &installBackup{root: root}
+	specs := []struct {
+		live  string
+		isDir bool
+		name  string
+	}{
+		{keysDir, true, "keys"},
+		{metaDir, true, "meta"},
+		{idxPath, false, "identities.json"},
+		{contactsPath, false, "contacts.json"},
+		{cfgPath, false, "config.toml"},
+	}
+	for _, s := range specs {
+		entry := backupEntry{live: s.live, isDir: s.isDir}
+		info, statErr := os.Stat(s.live)
+		switch {
+		case statErr == nil:
+			entry.existed = true
+			entry.stored = filepath.Join(root, s.name)
+			if cErr := copyPath(s.live, entry.stored, s.isDir, info.Mode()); cErr != nil {
+				b.discard()
+				return nil, fmt.Errorf("archiving %s: %w", s.live, cErr)
+			}
+		case !os.IsNotExist(statErr):
+			b.discard()
+			return nil, fmt.Errorf("inspecting %s: %w", s.live, statErr)
+		}
+		b.items = append(b.items, entry)
+	}
+	return b, nil
+}
+
+// restore reverts the install to the snapshot: directories are cleared and
+// repopulated, files are rewritten or (if absent at snapshot time) removed, so
+// any partial state the failed import wrote is undone. Best-effort across all
+// items; the collected errors are returned together so the caller can tell the
+// user the archive was kept.
+func (b *installBackup) restore() error {
+	var errs []string
+	for _, e := range b.items {
+		if err := e.restore(); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("%s", strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// restore reverts a single install path to its snapshot state.
+func (e backupEntry) restore() error {
+	if e.isDir {
+		if err := os.RemoveAll(e.live); err != nil {
+			return fmt.Errorf("clearing %s: %w", e.live, err)
+		}
+		if !e.existed {
+			return nil
+		}
+		if err := copyTree(e.stored, e.live); err != nil {
+			return fmt.Errorf("restoring %s: %w", e.live, err)
+		}
+		return nil
+	}
+	if e.existed {
+		if err := copyFile(e.stored, e.live, 0o600); err != nil {
+			return fmt.Errorf("restoring %s: %w", e.live, err)
+		}
+		return nil
+	}
+	if err := os.Remove(e.live); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("removing %s: %w", e.live, err)
+	}
+	return nil
+}
+
+// discard deletes the archive. Called on success, or after a successful restore.
+func (b *installBackup) discard() {
+	if b == nil || b.root == "" {
+		return
+	}
+	_ = os.RemoveAll(b.root)
+}
+
+// copyPath copies a file or directory tree from src to dst.
+func copyPath(src, dst string, isDir bool, mode os.FileMode) error {
+	if isDir {
+		return copyTree(src, dst)
+	}
+	return copyFile(src, dst, mode)
+}
+
+// copyFile copies src to dst (creating dst's parent), preserving the given mode.
+func copyFile(src, dst string, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		return err
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	if mode == 0 {
+		mode = 0o600
+	}
+	return os.WriteFile(dst, data, mode)
+}
+
+// copyTree recursively copies the directory src to dst.
+func copyTree(src, dst string) error {
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dst, 0o700); err != nil {
+		return err
+	}
+	for _, e := range entries {
+		s := filepath.Join(src, e.Name())
+		d := filepath.Join(dst, e.Name())
+		if e.IsDir() {
+			if err := copyTree(s, d); err != nil {
+				return err
+			}
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			return err
+		}
+		if err := copyFile(s, d, info.Mode()); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

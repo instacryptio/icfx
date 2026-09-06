@@ -15,7 +15,7 @@ func TestRunSyncGuards(t *testing.T) {
 	}
 
 	// Store but no account email → clear error.
-	c.SetSessionStore(DefaultSessionStore(t.TempDir(), false, func() (string, error) { return "p", nil }, nil))
+	c.SetSessionStore(DefaultSessionStore(t.TempDir(), false, func() ([]byte, error) { return []byte("p"), nil }, nil))
 	if _, err := c.RunSync(context.Background(), nil, SyncOptions{}); err == nil ||
 		!strings.Contains(err.Error(), "account") {
 		t.Fatalf("want account guard, got %v", err)

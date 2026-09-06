@@ -15,7 +15,14 @@ import (
 )
 
 // PassphraseFunc is a callback that returns a passphrase for encrypting/decrypting key files.
-type PassphraseFunc func() (string, error)
+//
+// It returns the passphrase as a wipeable []byte rather than an immutable Go
+// string: the consumer (this keystore) takes ownership of the returned slice
+// and zeroes it after use, so the master passphrase never lingers in an
+// un-zeroable string on the heap. Producers that cache a prompt must return a
+// FRESH copy each call (the consumer wipes what it receives). An empty/nil
+// slice means "no passphrase" (plaintext mode).
+type PassphraseFunc func() ([]byte, error)
 
 // FileStore stores keys as files in the keys directory.
 // When a PassphraseFunc is set, keys are encrypted at rest using age scrypt.
@@ -71,12 +78,14 @@ func NewEncryptedFileStoreWithDir(dir string, fn PassphraseFunc) *FileStore {
 	return &FileStore{dir: dir, passphraseFunc: fn}
 }
 
-// resolvePassphraseForName returns the passphrase/KEK string used to en/decrypt
-// the given identity's key files. Caches the result in memguard so repeated
-// reads/writes don't re-trigger callbacks. The name parameter is currently
-// unused (single-cache-slot mode) but is kept for symmetry with read/write
-// call sites and future per-identity key paths.
-func (f *FileStore) resolvePassphraseForName(_ string) (string, error) {
+// resolvePassphraseForName returns a FRESH, caller-owned copy of the
+// passphrase/KEK bytes used to en/decrypt the given identity's key files. The
+// caller MUST wipe the returned slice (crypto.Zero) after use. A nil slice
+// means plaintext mode (no passphrase). Caches the result in memguard so
+// repeated reads/writes don't re-trigger callbacks. The name parameter is
+// currently unused (single-cache-slot mode) but is kept for symmetry with
+// read/write call sites and future per-identity key paths.
+func (f *FileStore) resolvePassphraseForName(_ string) ([]byte, error) {
 	cacheKey := ""
 
 	f.mu.Lock()
@@ -86,35 +95,38 @@ func (f *FileStore) resolvePassphraseForName(_ string) (string, error) {
 
 	if resolved {
 		if !ok || cached == nil {
-			return "", nil
+			return nil, nil
 		}
 		buf, err := cached.Open()
 		if err != nil {
-			return "", fmt.Errorf("opening cached passphrase: %w", err)
+			return nil, fmt.Errorf("opening cached passphrase: %w", err)
 		}
-		pass := string(buf.Bytes())
+		out := make([]byte, len(buf.Bytes()))
+		copy(out, buf.Bytes())
 		buf.Destroy()
-		return pass, nil
+		return out, nil
 	}
 
 	pass, err := f.computePassphraseForName("")
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	f.cacheStore(cacheKey, pass)
+	f.cacheStore(cacheKey, pass) // seals a copy; leaves pass owned by the caller
 	return pass, nil
 }
 
 // computePassphraseForName invokes the configured callback to derive the
-// passphrase for the given identity. No callback set → empty (plaintext mode).
-func (f *FileStore) computePassphraseForName(_ string) (string, error) {
+// passphrase for the given identity. No callback set → nil (plaintext mode).
+func (f *FileStore) computePassphraseForName(_ string) ([]byte, error) {
 	if f.passphraseFunc != nil {
 		return f.passphraseFunc()
 	}
-	return "", nil
+	return nil, nil
 }
 
-func (f *FileStore) cacheStore(key string, pass string) {
+// cacheStore seals a COPY of pass into the single-slot memguard cache. It does
+// not consume pass — the caller retains and wipes the original.
+func (f *FileStore) cacheStore(key string, pass []byte) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.cache == nil {
@@ -122,11 +134,13 @@ func (f *FileStore) cacheStore(key string, pass string) {
 		f.resolved = make(map[string]bool)
 	}
 	f.resolved[key] = true
-	if pass == "" {
+	if len(pass) == 0 {
 		f.cache[key] = nil
 		return
 	}
-	buf := memguard.NewBufferFromBytes([]byte(pass))
+	cp := make([]byte, len(pass))
+	copy(cp, pass)
+	buf := memguard.NewBufferFromBytes(cp) // wipes cp, not pass
 	f.cache[key] = buf.Seal()
 }
 
@@ -217,9 +231,10 @@ func (f *FileStore) writeFile(filename string, data []byte) error {
 	if err != nil {
 		return fmt.Errorf("resolving passphrase: %w", err)
 	}
+	defer crypto.Zero(pass)
 
-	if pass != "" {
-		data, err = crypto.EncryptWithPassphrase(data, pass)
+	if len(pass) != 0 {
+		data, err = crypto.EncryptWithPassphraseBytes(data, pass)
 		if err != nil {
 			return fmt.Errorf("encrypting key file %s: %w", filename, err)
 		}
@@ -240,10 +255,11 @@ func (f *FileStore) readFile(filename string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolving passphrase: %w", err)
 	}
+	defer crypto.Zero(pass)
 
-	if pass != "" {
+	if len(pass) != 0 {
 		if isAgeEncrypted(data) {
-			decrypted, err := crypto.DecryptWithPassphrase(data, pass)
+			decrypted, err := crypto.DecryptWithPassphraseBytes(data, pass)
 			if err != nil {
 				return nil, fmt.Errorf("decrypting key file %s (wrong passphrase?): %w", filename, err)
 			}

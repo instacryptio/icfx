@@ -1,10 +1,14 @@
 package keystore
 
 import (
+	"bytes"
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/instacryptio/icfx/crypto"
 )
 
 func TestFileStore(t *testing.T) {
@@ -77,8 +81,8 @@ func TestEncryptedFileStore(t *testing.T) {
 	defer os.RemoveAll(dir)
 
 	passphrase := "test-passphrase-123"
-	fs := NewEncryptedFileStoreWithDir(dir, func() (string, error) {
-		return passphrase, nil
+	fs := NewEncryptedFileStoreWithDir(dir, func() ([]byte, error) {
+		return []byte(passphrase), nil
 	})
 
 	// Store and load encryption identity
@@ -129,8 +133,8 @@ func TestEncryptedFileStore(t *testing.T) {
 	}
 
 	// Verify wrong passphrase fails
-	wrongFS := NewEncryptedFileStoreWithDir(dir, func() (string, error) {
-		return "wrong-passphrase", nil
+	wrongFS := NewEncryptedFileStoreWithDir(dir, func() ([]byte, error) {
+		return []byte("wrong-passphrase"), nil
 	})
 	_, err = wrongFS.LoadEncryptionIdentity("test")
 	if err == nil {
@@ -159,8 +163,8 @@ func TestEncryptedFileStoreMigration(t *testing.T) {
 
 	// Read with encrypted store — should handle plaintext files gracefully when
 	// the caller opts into migration (default is to reject a plaintext key).
-	encFS := NewEncryptedFileStoreWithDir(dir, func() (string, error) {
-		return "some-passphrase", nil
+	encFS := NewEncryptedFileStoreWithDir(dir, func() ([]byte, error) {
+		return []byte("some-passphrase"), nil
 	})
 	encFS.AllowPlaintextMigration()
 
@@ -178,5 +182,55 @@ func TestEncryptedFileStoreMigration(t *testing.T) {
 	}
 	if string(sigKey) != "legacy-signing-key" {
 		t.Errorf("LoadSigningKey mismatch after migration")
+	}
+}
+
+// TestEncryptedFileStoreByteCallbackBackwardCompat pins the S0 invariant: the
+// switch from a string PassphraseFunc to a []byte one did NOT change the
+// on-disk format. A key file written by the pre-migration string API
+// (crypto.EncryptWithPassphrase) must still decrypt through the current
+// []byte-based FileStore given the same passphrase. If this ever fails, every
+// keystore written by an older build has become unreadable.
+func TestEncryptedFileStoreByteCallbackBackwardCompat(t *testing.T) {
+	dir := t.TempDir()
+	const pass = "legacy-passphrase-123"
+	const secret = "AGE-SECRET-KEY-PQ-1LEGACY"
+	signKey := []byte{0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01}
+
+	// Synthesize the exact bytes the old string-based keystore wrote to disk:
+	//   .enc  = Encrypt(identityString)
+	//   .sign = Encrypt(base64(signingKey))
+	oldEnc, err := crypto.EncryptWithPassphrase([]byte(secret), pass)
+	if err != nil {
+		t.Fatalf("legacy .enc encrypt: %v", err)
+	}
+	oldSign, err := crypto.EncryptWithPassphrase([]byte(base64.StdEncoding.EncodeToString(signKey)), pass)
+	if err != nil {
+		t.Fatalf("legacy .sign encrypt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "legacy.enc"), oldEnc, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "legacy.sign"), oldSign, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// The current []byte-callback store must read both back unchanged.
+	fs := NewEncryptedFileStoreWithDir(dir, func() ([]byte, error) { return []byte(pass), nil })
+
+	gotID, err := fs.LoadEncryptionIdentity("legacy")
+	if err != nil {
+		t.Fatalf("new store failed to load legacy-format .enc: %v", err)
+	}
+	if gotID != secret {
+		t.Fatalf("decrypted encryption identity %q, want %q", gotID, secret)
+	}
+
+	gotSign, err := fs.LoadSigningKey("legacy")
+	if err != nil {
+		t.Fatalf("new store failed to load legacy-format .sign: %v", err)
+	}
+	if !bytes.Equal(gotSign, signKey) {
+		t.Fatalf("decrypted signing key %x, want %x", gotSign, signKey)
 	}
 }
