@@ -1,6 +1,8 @@
-//go:build android || ios
+//go:build android || ios || nohw
 
-// Mobile stub: libfido2 (CGO, USB HID) is desktop-only. Mobile hardware-key
+// No-hardware stub: used on mobile (android/ios) AND on desktop with
+// `-tags nohw` (encryption-only consumers who don't want the libfido2 cgo
+// dependency). libfido2 (CGO, USB HID) is desktop-only. Mobile hardware-key
 // support means platform passkey APIs (Play Services FIDO2 / ASAuthorization)
 // — a separate integration, deferred.
 package fido2

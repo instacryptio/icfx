@@ -1,4 +1,4 @@
-//go:build !android && !ios
+//go:build !android && !ios && !nohw
 
 // Package chalresp performs HMAC-SHA1 challenge-response against the OTP
 // slot 2 of a Yubikey (or compatible: NitroKey Pro/Storage, OnlyKey).
@@ -56,6 +56,11 @@ var (
 	ErrTouchTimeout = errors.New("chalresp: timeout waiting for device touch")
 	// ErrNoDevice is returned when no compatible hardware key is detected.
 	ErrNoDevice = errors.New("chalresp: no compatible hardware key detected")
+	// ErrNotSupported mirrors the stub build's symbol so callers can reference
+	// chalresp.ErrNotSupported in ANY build (cgo desktop, mobile, or -tags nohw).
+	// The desktop cgo path never returns it (hardware IS supported here); the
+	// mobile/nohw stub returns it from every operation.
+	ErrNotSupported = errors.New("chalresp: hardware key challenge-response is not supported in this build")
 )
 
 var (

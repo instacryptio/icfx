@@ -24,6 +24,9 @@ can use it.
 The `#cgo pkg-config: ykpers-1` directive in `chalresp.go` resolves the
 include path and link flags from there.
 
+**Don't need hardware keys?** Build the whole module with `-tags nohw` (see the top-level README) to compile the
+pure-Go stub instead — then libykpers-1 is not required and cgo can be disabled entirely.
+
 ## Single-device today
 
 `chalresp.List()` opens via libykpers' `yk_open_first_key`, which picks the
