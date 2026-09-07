@@ -1,6 +1,8 @@
-//go:build android || ios
+//go:build android || ios || nohw
 
-// Package chalresp's mobile stub. The desktop implementation
+// Package chalresp's no-hardware stub — used on mobile (android/ios) AND on
+// desktop when built with `-tags nohw` (encryption-only consumers who don't
+// want the libykpers-1 cgo dependency). The desktop implementation
 // (chalresp.go) wraps libykpers via CGO, which is desktop-only — Android
 // and iOS can't link against ykpers-1. On mobile, ic-app's keystore
 // dispatch rejects HW-protected identities before any caller here is

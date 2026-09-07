@@ -1,4 +1,4 @@
-//go:build !android && !ios
+//go:build !android && !ios && !nohw
 
 // Package fido2 drives a physical FIDO2 security key through the client half
 // of the WebAuthn ceremonies (registration attestation + login assertion),

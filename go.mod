@@ -11,7 +11,7 @@ require (
 	github.com/fxamacker/cbor/v2 v2.9.2
 	github.com/google/uuid v1.6.0
 	github.com/keybase/go-keychain v0.0.1
-	github.com/keys-pub/go-libfido2 v1.5.3
+	github.com/keys-pub/go-libfido2 v1.5.4-0.20251021061633-bf2d0535e75c
 	github.com/makiuchi-d/gozxing v0.1.1
 	github.com/pquerna/otp v1.5.0
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e

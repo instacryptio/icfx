@@ -1,6 +1,12 @@
 # CHANGELOG
 
 
+**v0.1.3 - 09-07-2026**
+
+- Bumped go-libfido2
+- Added build tags for hardware keys opt-out
+
+
 **v0.1.2 - 09-07-2026**
 
 - Passphrases and ChalResp hardening

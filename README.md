@@ -63,6 +63,14 @@ A Go library providing post-quantum ready encryption, signing, key management, a
 ---
 
 - Go 1.26.6+
+- **Hardware-key support is optional and can be switched off at build time.** `hardware/chalresp` (YubiKey) and
+  `hardware/fido2` (FIDO2/WebAuthn) pull in the cgo C libraries listed below. If you use icfx only for encryption,
+  build with **`-tags nohw`** to stub them out — no cgo, no C libraries required:
+  ```
+  CGO_ENABLED=0 go build -tags nohw ./...
+  ```
+  (On macOS the OS keychain still uses the system Security.framework; use file-based key storage for a fully
+  cgo-free build there.)
 - OS keychain (optional — falls back to file-based storage)
 - libykpers-1 (optional — required only if you import `hardware/chalresp` for hardware-key support)
   - Linux (Debian/Ubuntu): `sudo apt install libykpers-1-dev`
@@ -75,7 +83,13 @@ A Go library providing post-quantum ready encryption, signing, key management, a
   - Linux (Debian/Ubuntu): `sudo apt install libfido2-dev`
   - Linux (Arch): `sudo pacman -S libfido2`
   - Linux (Fedora): `sudo dnf install libfido2-devel`
-  - macOS: `brew install libfido2`
+  - macOS: `brew install pkg-config libfido2 openssl@3` — go-libfido2 links openssl statically, so export the
+    keg-only paths so cgo can find them:
+    ```
+    export PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig:$PKG_CONFIG_PATH"
+    export CGO_CFLAGS="-I$(brew --prefix openssl@3)/include"
+    export CGO_LDFLAGS="-L$(brew --prefix openssl@3)/lib"
+    ```
   - Windows: install libfido2; link via mingw or vcpkg
 
 [ykpers-win]: https://developers.yubico.com/yubikey-personalization/Releases/
