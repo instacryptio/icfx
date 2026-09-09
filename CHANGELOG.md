@@ -1,6 +1,11 @@
 # CHANGELOG
 
 
+**v0.1.4 - 09-09-2026**
+
+- Fixed Windows identity store
+
+
 **v0.1.3 - 09-07-2026**
 
 - Bumped go-libfido2
