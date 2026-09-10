@@ -19,11 +19,13 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # cgo hardware backends need their C libs: hardware/chalresp uses
-      # `pkg-config: ykpers-1`, hardware/fido2 uses keys-pub/go-libfido2 (libfido2).
-      # Without these, `go build ./...` fails compiling those packages.
+      # cgo hardware backends need their C libs: hardware/chalresp uses go-hid,
+      # whose Linux hidraw backend needs libudev (libudev-dev); hardware/fido2
+      # uses keys-pub/go-libfido2 (libfido2-dev). Without these, `go build ./...`
+      # fails compiling those packages. (The optional PC/SC chalresp backend is
+      # build-tagged `pcsc` and not built here, so libpcsclite isn't needed.)
       - name: Install native deps
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libykpers-1-dev libfido2-dev
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev libfido2-dev
 
       - name: Build
         run: go build ./...

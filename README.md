@@ -52,7 +52,7 @@ A Go library providing post-quantum ready encryption, signing, key management, a
 | `sharing` | Transport for encrypted file shares — uploads/downloads pre-encrypted `.icfx` ciphertext (does no cryptography itself) |
 | `cloud` | Go client SDK for Instacrypt Cloud: transport, auth, billing, encrypted blob CRUD, directory, notification sync |
 | `keystore` | Abstract key storage — OS keychain or encrypted file backend |
-| `hardware/chalresp` | Optional Yubikey/compatible HMAC-SHA1 challenge-response (libykpers) |
+| `hardware/chalresp` | Optional YubiKey/compatible HMAC-SHA1 challenge-response over HID (go-hid); optional PC/SC backend for Nitrokey 3 |
 | `hardware/fido2` | Optional FIDO2/WebAuthn security-key client (libfido2) — registration and login |
 | `config` | TOML configuration and XDG-compliant path management |
 | `profile` | Full profile backup/restore via encrypted tarballs |
@@ -72,12 +72,15 @@ A Go library providing post-quantum ready encryption, signing, key management, a
   (On macOS the OS keychain still uses the system Security.framework; use file-based key storage for a fully
   cgo-free build there.)
 - OS keychain (optional — falls back to file-based storage)
-- libykpers-1 (optional — required only if you import `hardware/chalresp` for hardware-key support)
-  - Linux (Debian/Ubuntu): `sudo apt install libykpers-1-dev`
-  - Linux (Arch): `sudo pacman -S yubikey-personalization`
-  - Linux (Fedora): `sudo dnf install ykpers-devel`
-  - macOS: `brew install ykpers`
-  - Windows: install from [Yubico's yubikey-personalization releases][ykpers-win]; link via mingw or vcpkg
+- libudev (optional — required only if you import `hardware/chalresp` for hardware-key support). `hardware/chalresp`
+  talks to the device directly over HID via [go-hid](https://github.com/sstallion/go-hid); on Linux its hidraw
+  backend links libudev. macOS and Windows use the system HID APIs — no extra library needed there.
+  - Linux (Debian/Ubuntu): `sudo apt install libudev-dev`
+  - Linux (Arch): `sudo pacman -S systemd` (provides libudev)
+  - Linux (Fedora): `sudo dnf install systemd-devel`
+  - macOS / Windows: none (system HID)
+  - Optional PC/SC backend (Nitrokey 3): build with `-tags pcsc`. On Linux this additionally needs
+    `libpcsclite-dev` + a running `pcscd`; macOS/Windows use the system PC/SC service.
   - See `hardware/chalresp/README.md` for details
 - libfido2 (optional — required only if you import `hardware/fido2` for FIDO2/WebAuthn security keys)
   - Linux (Debian/Ubuntu): `sudo apt install libfido2-dev`
@@ -91,8 +94,6 @@ A Go library providing post-quantum ready encryption, signing, key management, a
     export CGO_LDFLAGS="-L$(brew --prefix openssl@3)/lib"
     ```
   - Windows: install libfido2; link via mingw or vcpkg
-
-[ykpers-win]: https://developers.yubico.com/yubikey-personalization/Releases/
 
 
 ### ⚗️ Tech Stack
