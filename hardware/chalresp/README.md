@@ -1,45 +1,55 @@
 # chalresp
 
-HMAC-SHA1 challenge-response against the OTP slot 2 of Yubikey-compatible
-hardware keys (Yubikey, NitroKey Pro/Storage, OnlyKey). CGO wrapper around
-[Yubico's libykpers][libykpers] — the same C library KeePassXC, ykman, and
-pam_yubico build on. Implements `crypto.HardwareKey` for icfx.
+HMAC-SHA1 challenge-response against OTP slot 2 of Yubico-compatible hardware
+keys, implementing `crypto.HardwareKey` for icfx.
+
+It speaks the wire protocols directly — **no libykpers, no libusb** — via
+[hidapi][gohid] (and optionally [PC/SC][scard]). This is what `ykman` and
+KeePassXC do, and it works on macOS/Windows/Linux/BSD without claiming the USB
+interface or any code-signing/entitlement.
 
 icfx does NOT program slots. Slot 2 must be pre-programmed for HMAC-SHA1
-challenge-response by the user's preferred tool (`ykman otp chalresp
---generate 2`, KeePassXC's setup flow, `ykpersonalize`, etc.) before icfx
-can use it.
+challenge-response by the user's tool (`ykman otp chalresp --generate 2`,
+Yubico Authenticator, KeePassXC's setup, the OnlyKey app, `nitropy nk3 secrets
+add-challenge-response 2 …`) before icfx can use it.
 
-## Build dependency
+## Supported devices
 
-| Platform | Install |
-|---|---|
-| Linux (Arch / CachyOS) | `sudo pacman -S yubikey-personalization` |
-| Linux (Debian / Ubuntu) | `sudo apt install libykpers-1-dev` |
-| Linux (Fedora / RHEL) | `sudo dnf install ykpers-devel` |
-| macOS | `brew install ykpers` |
-| Windows | install the [yubikey-personalization Windows build][ykpers-win] (bundles the DLL); link via mingw or vcpkg |
+| Device | Transport | Build | Notes |
+|---|---|---|---|
+| **YubiKey** (OTP-capable models) | HID (keyboard interface) | default | reference implementation; hardware-validated |
+| **OnlyKey** (firmware ≥2.1.0) | HID (keyboard interface) | default | firmware mirrors the YubiKey protocol byte-for-byte |
+| **Nitrokey 3** | CCID / PC-SC (Yubico OATH applet) | `-tags pcsc` | implemented to spec, **untested pending hardware** |
+| YubiKey over CCID | CCID / PC-SC | `-tags pcsc` | bonus of the PC/SC path |
 
-`pkg-config --modversion ykpers-1` should report a version after install.
-The `#cgo pkg-config: ykpers-1` directive in `chalresp.go` resolves the
-include path and link flags from there.
+**Not supported:** Nitrokey Pro / Storage (they have no YubiKey-style HMAC-SHA1
+challenge-response — the earlier "NitroKey Pro/Storage" claim was never real).
 
-**Don't need hardware keys?** Build the whole module with `-tags nohw` (see the top-level README) to compile the
-pure-Go stub instead — then libykpers-1 is not required and cgo can be disabled entirely.
+## Build dependencies
 
-## Single-device today
+- **Default (HID: YubiKey + OnlyKey)** — cgo via `sstallion/go-hid`, which
+  bundles hidapi. Linux uses the hidraw backend (a `libudev` dev package may be
+  needed to build; a `/dev/hidraw*` udev rule for VID `1050`/`1d50` for runtime
+  access). macOS/Windows need no extra packages.
+- **`-tags pcsc` (adds Nitrokey 3 + YubiKey-CCID)** — cgo via `ebfe/scard`.
+  macOS (`PCSC.framework`) and Windows (`WinSCard`) ship PC/SC in the system;
+  **Linux needs `libpcsclite`-dev to build and `pcscd` running at runtime.**
+  Keep `github.com/ebfe/scard` in `go.mod` — a bare `go mod tidy` (without the
+  `pcsc` tag) will prune it and break the tagged build.
+- **No hardware keys?** Build the module with `-tags nohw` for the pure-Go stub
+  — cgo can be disabled entirely and neither dependency is required.
 
-`chalresp.List()` opens via libykpers' `yk_open_first_key`, which picks the
-first detected device. Multi-device support (plug in two keys, choose one
-by serial) is post-MVP — the existing `DeviceDescriptor.Serial` field is
-populated for forward compatibility.
+## Multi-transport enumeration
+
+`chalresp.List()` merges HID and (when built with `-tags pcsc`) PC/SC results;
+`Open`/`Challenge`/`IsSlot2Programmed` route to the transport the device was
+found on. PC/SC enumeration is best-effort — a missing `pcscd` never breaks HID.
 
 ## Mobile (Android / iOS) is out of scope
 
-Mobile USB / NFC access does not flow through libykpers — Android requires
-the Yubico Android SDK (Java/Kotlin via JNI) and iOS requires the Yubico
-iOS SDK (Swift, with NFC for non-MFi access). Each is a separate flugo
-bridge effort. Desktop only here.
+The desktop files are `//go:build !android && !ios && !nohw`; mobile uses the
+`chalresp_mobile.go` stub. Actual mobile HW-key support lives in flugo
+(`flugo/pkg/hardware/nfckey`) via the Yubico Android/iOS SDKs.
 
-[libykpers]: https://github.com/Yubico/yubikey-personalization
-[ykpers-win]: https://developers.yubico.com/yubikey-personalization/Releases/
+[gohid]: https://github.com/sstallion/go-hid
+[scard]: https://github.com/ebfe/scard

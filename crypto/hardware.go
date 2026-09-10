@@ -53,6 +53,13 @@ func DeriveHardwareKEKBytes(pass, hwResponse []byte) ([]byte, error) {
 	if len(hwResponse) == 0 {
 		return nil, fmt.Errorf("empty hardware response")
 	}
+	// Reject a degenerate all-zero response: it would nullify the hardware factor
+	// (the KEK would be derivable from the passphrase alone). A genuine HMAC-SHA1
+	// is never all-zero; an all-zero salt signals a device malfunction or a
+	// non-genuine token, so fail closed rather than seal/unlock with it.
+	if allZero(hwResponse) {
+		return nil, fmt.Errorf("degenerate (all-zero) hardware response")
+	}
 	// NOTE: an empty passphrase is intentionally allowed. Keychain-origin
 	// identities (HWKEKNone) derive the KEK from the hardware response alone,
 	// with the OS keychain (Android Keystore / macOS Keychain) as the second
@@ -67,4 +74,14 @@ func DeriveHardwareKEKBytes(pass, hwResponse []byte) ([]byte, error) {
 		return nil, fmt.Errorf("deriving KEK: %w", err)
 	}
 	return kek, nil
+}
+
+// allZero reports whether every byte of b is zero.
+func allZero(b []byte) bool {
+	for _, x := range b {
+		if x != 0 {
+			return false
+		}
+	}
+	return true
 }

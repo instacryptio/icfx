@@ -1,118 +1,81 @@
 //go:build !android && !ios && !nohw
 
-// Package chalresp performs HMAC-SHA1 challenge-response against the OTP
-// slot 2 of a Yubikey (or compatible: NitroKey Pro/Storage, OnlyKey).
+// Package chalresp performs HMAC-SHA1 challenge-response against OTP slot 2 of a
+// YubiKey (or a compatible device) to derive a hardware-augmented KEK.
 //
-// This is a thin CGO wrapper around Yubico's libykpers — the same C library
-// that KeePassXC, ykman, and pam_yubico build on. We delegate the wire
-// protocol entirely; this package's job is just to expose libykpers as a Go
-// API that satisfies icfx's crypto.HardwareKey contract.
+// It speaks the YubiKey OTP-over-HID feature-report protocol directly via hidapi
+// (github.com/sstallion/go-hid) — no libykpers, no libusb. This is what KeePassXC
+// and ykman do, and it works on macOS/Windows/Linux/BSD without claiming the USB
+// interface or any entitlement. icfx does not provision hardware keys; slot
+// programming is delegated to the user's tool (Yubico Authenticator, ykman,
+// KeePassXC, the OnlyKey app, etc.).
 //
-// Build dependency:
+// Supported today (verified against device firmware / KeePassXC):
+//   - YubiKey — the reference implementation of this HID protocol.
+//   - OnlyKey (firmware >=2.1.0) — implements the identical HID protocol.
 //
-//	Linux (Arch):     pacman -S yubikey-personalization
-//	Linux (Debian):   apt install libykpers-1-dev
-//	Linux (Fedora):   dnf install ykpers-devel
-//	macOS:            brew install ykpers
-//	Windows:          install yubikey-personalization (mingw or vcpkg)
+// Nitrokey 3 uses a different transport (CCID/PC-SC) and is handled by a separate
+// backend (added in a follow-up); Nitrokey Pro/Storage do not support HMAC-SHA1
+// challenge-response at all.
 //
-// Single-device assumption: this package picks the first detected device
-// (libykpers' yk_open_first_key). Multi-device support is post-MVP.
+// The exported surface is unchanged from the former libykpers binding, so
+// ic-cli and ic-app compile without modification.
 package chalresp
-
-/*
-#cgo pkg-config: ykpers-1
-#include <stdlib.h>
-#include <string.h>
-#include <ykpers-1/ykcore.h>
-#include <ykpers-1/ykdef.h>
-#include <ykpers-1/ykstatus.h>
-*/
-import "C"
 
 import (
 	"errors"
 	"fmt"
-	"sync"
-	"unsafe"
 )
-
-// hmacSHA1OutLen is the byte length of an HMAC-SHA1 response.
-const hmacSHA1OutLen = 20
-
-// responseBufSize is what we hand to libykpers as the response buffer.
-// libykpers internally reads response data in 7-byte chunks until it sees
-// a termination marker, and the buffer must be at least 28 bytes (20-byte
-// HMAC + 2-byte CRC, padded to the next multiple of 7). KeePassXC uses 64
-// — we mirror that for headroom.
-const responseBufSize = 64
 
 var (
 	// ErrSlotNotConfigured is returned when the targeted slot is empty.
 	ErrSlotNotConfigured = errors.New("chalresp: slot not configured")
-	// ErrTouchTimeout is returned when the device is configured to require
-	// a button press and the user does not touch it within libykpers'
-	// internal wait window.
+	// ErrTouchTimeout is returned when a slot configured to require a button
+	// press is not touched within the wait window.
 	ErrTouchTimeout = errors.New("chalresp: timeout waiting for device touch")
 	// ErrNoDevice is returned when no compatible hardware key is detected.
 	ErrNoDevice = errors.New("chalresp: no compatible hardware key detected")
 	// ErrNotSupported mirrors the stub build's symbol so callers can reference
-	// chalresp.ErrNotSupported in ANY build (cgo desktop, mobile, or -tags nohw).
-	// The desktop cgo path never returns it (hardware IS supported here); the
-	// mobile/nohw stub returns it from every operation.
+	// chalresp.ErrNotSupported in ANY build (desktop, mobile, or -tags nohw).
+	// The desktop path never returns it (hardware IS supported here).
 	ErrNotSupported = errors.New("chalresp: hardware key challenge-response is not supported in this build")
 )
 
-var (
-	initOnce sync.Once
-	initErr  error
+// backendKind selects the transport a descriptor was found on. The zero value
+// is backendHID, so HID descriptors need not set it explicitly.
+type backendKind uint8
+
+const (
+	backendHID  backendKind = iota // YubiKey / OnlyKey over the OTP HID interface
+	backendPCSC                    // Nitrokey 3 / YubiKey over CCID (PC/SC), build tag `pcsc`
 )
 
-// ensureInit lazily initializes libykpers. yk_init() / yk_release() are
-// global; we init once for the process lifetime and never explicitly release
-// (the OS reclaims on exit).
-func ensureInit() error {
-	initOnce.Do(func() {
-		if C.yk_init() == 0 {
-			initErr = errors.New("chalresp: yk_init failed (libykpers/libusb couldn't initialize)")
-		}
-	})
-	return initErr
-}
-
-// DeviceDescriptor identifies a connected hardware key. With the
-// single-device assumption baked in here, the descriptor is a thin marker
-// — Family is filled in for display purposes; Serial may be empty if the
-// device's firmware doesn't expose one. Future multi-device support will
-// add path / index fields.
+// DeviceDescriptor identifies a connected hardware key. Family is filled in for
+// display; Serial may be empty if the firmware doesn't expose one. The
+// unexported routing fields locate the device for Open/Challenge.
 type DeviceDescriptor struct {
-	Family string // always "yubikey" today (libykpers auto-detects compatible devices)
-	Serial string // device serial; empty if not available
+	Family string // "yubikey", "onlykey", or "nitrokey"
+	Serial string // device serial; empty if unavailable
+
+	backend backendKind
+	path    string // HID device path (backendHID)
+	//lint:ignore U1000 set/read only in the pcsc-tagged backend (chalresp_pcsc.go)
+	reader string // PC/SC reader name (backendPCSC)
 }
 
-// List returns descriptors for connected hardware keys. Currently returns
-// at most one descriptor (the first device libykpers can open). Returns
-// nil, nil if no device is present — the empty list signals "none" without
-// being an error condition.
+// List returns descriptors for connected hardware keys across all transports.
+// Returns an empty slice (not an error) when none are present. PC/SC is
+// best-effort: a missing pcscd / no readers must never break HID enumeration.
 func List() ([]DeviceDescriptor, error) {
-	if err := ensureInit(); err != nil {
+	hids, err := hidList()
+	if err != nil {
 		return nil, err
 	}
-	yk := C.yk_open_first_key()
-	if yk == nil {
-		return nil, nil
-	}
-	defer C.yk_close_key(yk)
-
-	desc := DeviceDescriptor{Family: "yubikey"}
-	if s, err := readSerial(yk); err == nil {
-		desc.Serial = s
-	}
-	return []DeviceDescriptor{desc}, nil
+	pcs, _ := pcscList() // best-effort; errors (no PC/SC service) are non-fatal
+	return append(hids, pcs...), nil
 }
 
-// Detect returns the first connected supported device, or ErrNoDevice if
-// none is found.
+// Detect returns the first connected supported device, or ErrNoDevice.
 func Detect() (*DeviceDescriptor, error) {
 	devices, err := List()
 	if err != nil {
@@ -124,106 +87,108 @@ func Detect() (*DeviceDescriptor, error) {
 	return &devices[0], nil
 }
 
-// IsSlot2Programmed reports whether slot 2 has a valid HMAC-SHA1
-// configuration on the device, by reading YK_STATUS.touchLevel and
-// checking the CONFIG2_VALID bit. No challenge issued, no touch required.
-func IsSlot2Programmed(_ DeviceDescriptor) (bool, error) {
-	if err := ensureInit(); err != nil {
-		return false, err
+// IsSlot2Programmed reports whether slot 2 has a valid HMAC-SHA1 configuration,
+// by reading the device status and checking CONFIG2_VALID. No challenge issued,
+// no touch required.
+func IsSlot2Programmed(desc DeviceDescriptor) (bool, error) {
+	if desc.backend == backendPCSC {
+		return pcscIsSlot2Programmed(desc)
 	}
-	yk := C.yk_open_first_key()
-	if yk == nil {
-		return false, ErrNoDevice
-	}
-	defer C.yk_close_key(yk)
-
-	status := C.ykds_alloc()
-	defer C.ykds_free(status)
-	if C.yk_get_status(yk, status) == 0 {
-		return false, errors.New("chalresp: yk_get_status failed")
-	}
-	touchLevel := C.ykds_touch_level(status)
-	return (touchLevel & C.CONFIG2_VALID) != 0, nil
+	return hidIsSlot2Programmed(desc)
 }
 
-// Key implements crypto.HardwareKey. It records a descriptor at Open time
-// but defers the actual USB device handle to each Challenge call — this
-// matches KeePassXC's pattern and lets concurrent applications (ykman,
-// other ic-cli invocations) take turns with the device cleanly.
+// Key implements crypto.HardwareKey. It records a descriptor at Open time and
+// opens the device per Challenge call. In-process calls are serialized (the
+// device's OTP state machine is global to the physical key), and the per-call
+// open lets other applications take turns with the device between calls.
 type Key struct {
 	desc DeviceDescriptor
 }
 
-// Open prepares a Key bound to the given device. The actual libykpers
-// device handle is opened per Challenge call.
+// Open prepares a Key bound to the given device.
 func Open(desc DeviceDescriptor) (*Key, error) {
-	if err := ensureInit(); err != nil {
-		return nil, err
-	}
 	return &Key{desc: desc}, nil
 }
 
-// Challenge implements crypto.HardwareKey. Sends the challenge bytes to
-// slot 2 over libykpers and returns the 20-byte HMAC-SHA1 response.
-//
-// may_block is set to true so that slots configured to require a button
-// touch (KeePassXC's recommended setup) will wait for the user to touch
-// rather than failing immediately.
+// Challenge sends the challenge bytes to slot 2 and returns the 20-byte
+// HMAC-SHA1 response. Slots configured to require a button touch (recommended)
+// will wait for the user to touch rather than failing immediately.
 func (k *Key) Challenge(challenge []byte) ([]byte, error) {
 	if len(challenge) == 0 {
 		return nil, errors.New("chalresp: empty challenge")
 	}
-
-	yk := C.yk_open_first_key()
-	if yk == nil {
-		return nil, ErrNoDevice
+	if len(challenge) > frameDataSize {
+		return nil, fmt.Errorf("chalresp: challenge too long (%d > %d bytes)", len(challenge), frameDataSize)
 	}
-	defer C.yk_close_key(yk)
-
-	resp := make([]byte, responseBufSize)
-	res := C.yk_challenge_response(
-		yk,
-		C.uint8_t(C.SLOT_CHAL_HMAC2),
-		C.int(1), // may_block: wait for touch if slot requires it
-		C.uint(len(challenge)),
-		(*C.uchar)(unsafe.Pointer(&challenge[0])),
-		C.uint(len(resp)),
-		(*C.uchar)(unsafe.Pointer(&resp[0])),
-	)
-	if res == 0 {
-		// Map the one reliably-distinguishable libykpers errno to the documented
-		// sentinel; touch-required slots return YK_EWOULDBLOCK when the user
-		// doesn't press in time. (libykpers has no distinct "slot not configured"
-		// errno, so that case stays a generic failure.)
-		if C.yk_errno == C.YK_EWOULDBLOCK {
-			return nil, ErrTouchTimeout
-		}
-		return nil, fmt.Errorf("chalresp: yk_challenge_response failed: %s (slot empty? device removed? wrong slot configuration?)", C.GoString(C.yk_strerror(C.yk_errno)))
+	if k.desc.backend == backendPCSC {
+		return pcscChallenge(k.desc, challenge)
 	}
-	return resp[:hmacSHA1OutLen], nil
+	return hidChallenge(k.desc, challenge, true /* may_block: wait for touch if required */)
 }
 
-// Serial returns the device's serial number string. May be empty if the
-// device firmware doesn't expose it via the OTP HID interface.
+// Serial returns the device's serial number string (may be empty).
 func (k *Key) Serial() string { return k.desc.Serial }
 
-// Type returns the device family string. Currently always "yubikey" since
-// libykpers' detection is family-agnostic for compatible devices.
+// Type returns the device family string ("yubikey" / "onlykey").
 func (k *Key) Type() string { return k.desc.Family }
 
 // Descriptor returns a copy of the device descriptor.
 func (k *Key) Descriptor() DeviceDescriptor { return k.desc }
 
-// readSerial queries the device's serial number via libykpers. Returns
-// the empty string + nil error if the device doesn't expose a serial
-// (older firmware, NitroKey, OnlyKey).
-func readSerial(yk *C.YK_KEY) (string, error) {
-	var serial C.uint
-	if C.yk_get_serial(yk, 0, 0, &serial) == 0 {
-		return "", nil
+// wipe best-effort zeroes an intermediate buffer that held the secret HMAC
+// response. The final returned copy is wiped by the caller (DeriveHardwareKEK);
+// this clears the transient accumulators before they're garbage-collected.
+func wipe(b []byte) {
+	for i := range b {
+		b[i] = 0
 	}
-	if serial == 0 {
-		return "", nil
+}
+
+// APDU status words + GET RESPONSE chaining, used by the PC/SC backend. Kept
+// here (transport-agnostic, no scard dependency) so the DoS bounds are unit-
+// testable without a PC/SC stack.
+const (
+	insGetResp = 0xc0
+	swMore     = 0x61 // "61 xx": xx more bytes available via GET RESPONSE
+	swOKHi     = 0x90
+	swOKLo     = 0x00
+
+	// Bound the GET RESPONSE chain so a malicious/buggy card can't hang the
+	// unlock forever (bare "61 01") or grow the buffer without bound. The
+	// expected HMAC response is 20 bytes; both caps are far above any legit exchange.
+	maxAPDUChain = 16
+	maxAPDUBytes = 4096
+)
+
+// transmitChain sends an APDU via transmit and follows ISO-7816 "61 xx" GET
+// RESPONSE chaining, returning the accumulated data (without status words). It
+// errors on any status word other than 90 00 / 61 xx, and bounds both the chain
+// length and total size.
+func transmitChain(transmit func(apdu []byte) ([]byte, error), apdu []byte) ([]byte, error) {
+	var out []byte
+	for i := 0; ; i++ {
+		if i >= maxAPDUChain {
+			return nil, errors.New("chalresp: too many GET RESPONSE chunks")
+		}
+		resp, err := transmit(apdu)
+		if err != nil {
+			return nil, fmt.Errorf("chalresp: APDU transmit: %w", err)
+		}
+		if len(resp) < 2 {
+			return nil, errors.New("chalresp: truncated APDU response")
+		}
+		sw1, sw2 := resp[len(resp)-2], resp[len(resp)-1]
+		out = append(out, resp[:len(resp)-2]...)
+		if len(out) > maxAPDUBytes {
+			return nil, errors.New("chalresp: APDU response too large")
+		}
+		switch {
+		case sw1 == swOKHi && sw2 == swOKLo:
+			return out, nil
+		case sw1 == swMore:
+			apdu = []byte{0x00, insGetResp, 0x00, 0x00, sw2}
+		default:
+			return nil, fmt.Errorf("chalresp: APDU error SW=%02x%02x", sw1, sw2)
+		}
 	}
-	return fmt.Sprintf("%d", uint32(serial)), nil
 }
