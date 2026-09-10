@@ -1,6 +1,12 @@
 # CHANGELOG
 
 
+**v0.1.5 - 09-10-2026**
+
+- Migrated to hidapi (removed ykpers)
+- Added nitrokey 1st pass proper (needs testing)
+
+
 **v0.1.4 - 09-09-2026**
 
 - Fixed Windows identity store

@@ -56,6 +56,21 @@ func TestDeriveHardwareKEK_EmptyResponse(t *testing.T) {
 	}
 }
 
+// An all-zero hardware response is degenerate (it would nullify the hardware
+// factor) and must be rejected — a genuine HMAC-SHA1 is never all-zero; an
+// all-zero salt signals a malfunctioning or non-genuine device.
+func TestDeriveHardwareKEK_AllZeroResponseRejected(t *testing.T) {
+	if _, err := DeriveHardwareKEK("pass", make([]byte, 20)); err == nil {
+		t.Errorf("expected error for all-zero hardware response")
+	}
+	// A single non-zero byte makes it non-degenerate and derives normally.
+	nonzero := make([]byte, 20)
+	nonzero[19] = 0x01
+	if _, err := DeriveHardwareKEK("pass", nonzero); err != nil {
+		t.Errorf("non-degenerate response should derive: %v", err)
+	}
+}
+
 // An EMPTY passphrase must be accepted: keychain-origin identities (HWKEKNone)
 // derive the KEK from the hardware response alone, with the OS keychain as the
 // second factor. Rejecting it here breaks HW-only keychain unlock (regression
