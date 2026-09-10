@@ -96,8 +96,16 @@ func hidList() ([]DeviceDescriptor, error) {
 	var out []DeviceDescriptor
 	collect := func(family string) hid.EnumFunc {
 		return func(info *hid.DeviceInfo) error {
-			// Only the keyboard collection carries chalresp; skip FIDO/other.
-			if info.UsagePage != usagePageKeyboard || info.Usage != usageKeyboard {
+			// The OTP/chalresp interface is the HID keyboard collection. The hidraw
+			// backend (Linux) populates UsagePage/Usage, so match the keyboard there.
+			// The libusb backend (macOS/*BSD) does NOT fill usage (hidapi's
+			// INVASIVE_GET_USAGE is off), leaving both 0 — there, fall back to USB
+			// interface 0, which is the OTP interface on YubiKey/OnlyKey whenever it's
+			// enabled (FIDO/CCID are later interfaces). This keeps us off the FIDO
+			// collection on both backends.
+			isKeyboard := info.UsagePage == usagePageKeyboard && info.Usage == usageKeyboard
+			usageUnknown := info.UsagePage == 0 && info.Usage == 0
+			if !isKeyboard && !(usageUnknown && info.InterfaceNbr == 0) {
 				return nil
 			}
 			out = append(out, DeviceDescriptor{

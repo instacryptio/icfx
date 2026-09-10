@@ -51,6 +51,13 @@ func pcscList() ([]DeviceDescriptor, error) {
 	}
 	var out []DeviceDescriptor
 	for _, reader := range readers {
+		// YubiKey slot-2 HMAC challenge-response is HID-only; its CCID OATH applet
+		// answers SELECT but NOT the HMAC APDU (returns 6B00). The HID backend handles
+		// YubiKeys, so never surface one here — otherwise on macOS (where the OS PC/SC
+		// service exposes the YubiKey's CCID iface) it would shadow the HID path.
+		if familyForReader(reader) == "yubikey" {
+			continue
+		}
 		card, err := ctx.Connect(reader, scard.ShareShared, scard.ProtocolAny)
 		if err != nil {
 			continue // no card / in use
