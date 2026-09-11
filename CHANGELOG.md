@@ -1,8 +1,16 @@
 # CHANGELOG
 
 
+**v0.1.6 - 09-11-2026**
+
+- Pin goroutine to OS thread for macos
+- SetOpenExclusive(false) for darwin
+- hidList and pcscList fixes
+
+
 **v0.1.5 - 09-10-2026**
 
+- Migrated to hidapi (removed ykpers)
 - Migrated to hidapi (removed ykpers)
 - Added nitrokey 1st pass proper (needs testing)
 
