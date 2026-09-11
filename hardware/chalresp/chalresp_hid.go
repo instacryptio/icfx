@@ -15,6 +15,7 @@ package chalresp
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"time"
 
@@ -177,6 +178,15 @@ func hidChallenge(desc DeviceDescriptor, challenge []byte, mayBlock bool) ([]byt
 // withDevice opens the device (by its enumerated path, or the first available
 // one if the descriptor carries none), runs fn, and closes it.
 func withDevice(desc DeviceDescriptor, fn func(*hid.Device) error) error {
+	// Pin this goroutine to its OS thread for the whole device interaction. On
+	// macOS, IOKit's IOHIDDeviceGetReport/SetReport do mach calls that Go's async
+	// preemption (SIGURG, Go 1.14+) can interrupt, surfacing as a transient
+	// kIOReturnError (0xE00002BC) — the report backends (hidraw/HID.dll) are
+	// unaffected, but LockOSThread is harmless there. Keeping every open + feature
+	// report + close on one thread eliminates the interruption. (See go-hid #15.)
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	if err := hidEnsureInit(); err != nil {
 		return err
 	}
