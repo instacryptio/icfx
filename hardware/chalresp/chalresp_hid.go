@@ -15,6 +15,7 @@ package chalresp
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"time"
 
@@ -82,7 +83,15 @@ func hidEnsureInit() error {
 	hidInitOnce.Do(func() {
 		if err := hid.Init(); err != nil {
 			hidInitErr = fmt.Errorf("chalresp: hidapi init failed: %w", err)
+			return
 		}
+		// macOS: open the OTP interface NON-exclusively. hidapi's darwin backend
+		// defaults to kIOHIDOptionsTypeSeizeDevice ("backward compatibility"), but
+		// *seizing* a keyboard-class device needs more privilege than Input
+		// Monitoring grants, so IOHIDDeviceOpen returns kIOReturnNotPermitted even
+		// with the permission granted. ykman opens non-exclusively and works — match
+		// it. No-op on non-darwin backends. (hidConfigureOpen is platform-split.)
+		hidConfigureOpen()
 	})
 	return hidInitErr
 }
@@ -96,8 +105,16 @@ func hidList() ([]DeviceDescriptor, error) {
 	var out []DeviceDescriptor
 	collect := func(family string) hid.EnumFunc {
 		return func(info *hid.DeviceInfo) error {
-			// Only the keyboard collection carries chalresp; skip FIDO/other.
-			if info.UsagePage != usagePageKeyboard || info.Usage != usageKeyboard {
+			// The OTP/chalresp interface is the HID keyboard collection. The hidraw
+			// backend (Linux) populates UsagePage/Usage, so match the keyboard there.
+			// The libusb backend (macOS/*BSD) does NOT fill usage (hidapi's
+			// INVASIVE_GET_USAGE is off), leaving both 0 — there, fall back to USB
+			// interface 0, which is the OTP interface on YubiKey/OnlyKey whenever it's
+			// enabled (FIDO/CCID are later interfaces). This keeps us off the FIDO
+			// collection on both backends.
+			isKeyboard := info.UsagePage == usagePageKeyboard && info.Usage == usageKeyboard
+			usageUnknown := info.UsagePage == 0 && info.Usage == 0
+			if !isKeyboard && !(usageUnknown && info.InterfaceNbr == 0) {
 				return nil
 			}
 			out = append(out, DeviceDescriptor{
@@ -161,6 +178,15 @@ func hidChallenge(desc DeviceDescriptor, challenge []byte, mayBlock bool) ([]byt
 // withDevice opens the device (by its enumerated path, or the first available
 // one if the descriptor carries none), runs fn, and closes it.
 func withDevice(desc DeviceDescriptor, fn func(*hid.Device) error) error {
+	// Pin this goroutine to its OS thread for the whole device interaction. On
+	// macOS, IOKit's IOHIDDeviceGetReport/SetReport do mach calls that Go's async
+	// preemption (SIGURG, Go 1.14+) can interrupt, surfacing as a transient
+	// kIOReturnError (0xE00002BC) — the report backends (hidraw/HID.dll) are
+	// unaffected, but LockOSThread is harmless there. Keeping every open + feature
+	// report + close on one thread eliminates the interruption. (See go-hid #15.)
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	if err := hidEnsureInit(); err != nil {
 		return err
 	}
