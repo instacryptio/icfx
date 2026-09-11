@@ -82,7 +82,15 @@ func hidEnsureInit() error {
 	hidInitOnce.Do(func() {
 		if err := hid.Init(); err != nil {
 			hidInitErr = fmt.Errorf("chalresp: hidapi init failed: %w", err)
+			return
 		}
+		// macOS: open the OTP interface NON-exclusively. hidapi's darwin backend
+		// defaults to kIOHIDOptionsTypeSeizeDevice ("backward compatibility"), but
+		// *seizing* a keyboard-class device needs more privilege than Input
+		// Monitoring grants, so IOHIDDeviceOpen returns kIOReturnNotPermitted even
+		// with the permission granted. ykman opens non-exclusively and works — match
+		// it. No-op on non-darwin backends. (hidConfigureOpen is platform-split.)
+		hidConfigureOpen()
 	})
 	return hidInitErr
 }
