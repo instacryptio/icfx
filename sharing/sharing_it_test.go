@@ -11,7 +11,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -77,10 +79,10 @@ func upgradeToBasic(t *testing.T, accountID string) {
 	}
 }
 
-// buildContainer produces a v2 ICFX container encrypted to lock, mirroring
-// what the icc/ic-app encrypt flows produce locally: metadata encrypted
-// inside the payload, plus a plaintext header copy (as icc --public-meta
-// would) so the test can prove SendEncrypted strips it before upload.
+// buildContainer produces an unsigned ProfilePublic container encrypted to
+// lock, mirroring what `icc encrypt --public-meta` writes: metadata sealed
+// inside the payload plus an advisory plaintext header copy, so the test can
+// prove SendEncrypted strips the header before upload.
 func buildContainer(t *testing.T, plain []byte, lock, senderFp, origName string) []byte {
 	t.Helper()
 	meta := format.Metadata{
@@ -97,16 +99,30 @@ func buildContainer(t *testing.T, plain []byte, lock, senderFp, origName string)
 	if err != nil {
 		t.Fatalf("encrypt payload: %v", err)
 	}
-	c := &format.Container{
-		Profile:  format.ProfilePrivateBuffered,
-		Metadata: meta,
-		Payload:  payload,
-	}
-	data, err := c.Serialize()
+	headerMeta, err := json.Marshal(meta)
 	if err != nil {
-		t.Fatalf("serialize container: %v", err)
+		t.Fatalf("marshal header: %v", err)
 	}
-	return data
+	data := append([]byte{}, format.MagicBytes...)
+	data = append(data, byte(format.ProfilePublic))
+	data = binary.BigEndian.AppendUint16(data, uint16(len(headerMeta)))
+	data = append(data, headerMeta...)
+	data = binary.BigEndian.AppendUint64(data, uint64(len(payload)))
+	data = append(data, payload...)
+	return binary.BigEndian.AppendUint16(data, 0)
+}
+
+// stripHeader returns the container with its advisory header removed, as the
+// upload path does in place (format.ZeroMetaLen + skipping the header bytes).
+func stripHeader(t *testing.T, data []byte) []byte {
+	t.Helper()
+	head := append([]byte{}, data[:format.HeaderPrefixLen]...)
+	_, metaLen, err := format.ParseHeaderPrefix(head)
+	if err != nil {
+		t.Fatalf("parse prefix: %v", err)
+	}
+	format.ZeroMetaLen(head)
+	return append(head, data[format.HeaderPrefixLen+metaLen:]...)
 }
 
 func TestShareContainerRoundTrip(t *testing.T) {
@@ -153,10 +169,7 @@ func TestShareContainerRoundTrip(t *testing.T) {
 	}
 	// The uploaded object is the STRIPPED container: same payload, empty
 	// header (the plaintext metadata block is removed before upload).
-	strippedLocal, err := format.StripHeader(container)
-	if err != nil {
-		t.Fatalf("strip reference: %v", err)
-	}
+	strippedLocal := stripHeader(t, container)
 	if sent.ShareID == "" || sent.CiphertextBytes != int64(len(strippedLocal)) {
 		t.Fatalf("send result mismatch: %+v (stripped container %d bytes)", sent, len(strippedLocal))
 	}
@@ -202,14 +215,15 @@ func TestShareContainerRoundTrip(t *testing.T) {
 	if format.Detect(buf.Bytes()) != format.FormatICFX {
 		t.Fatal("downloaded payload is not an ICFX container")
 	}
-	parsed, err := format.Deserialize(buf.Bytes())
+	sh, err := format.ParseStreamHeader(bytes.NewReader(buf.Bytes()))
 	if err != nil {
-		t.Fatalf("deserialize: %v", err)
+		t.Fatalf("parse stored container: %v", err)
 	}
-	if !parsed.Private || parsed.Metadata.OriginalFilename != "" {
-		t.Fatalf("stored container should be private: %+v", parsed.Metadata)
+	if !sh.Private || sh.HeaderMeta.OriginalFilename != "" {
+		t.Fatalf("stored container should carry no header: %+v", sh.HeaderMeta)
 	}
-	inner, err := crypto.Decrypt(parsed.Payload, kpBob.EncryptionIdentity)
+	storedPayload := buf.Bytes()[sh.PayloadStart : sh.PayloadStart+sh.PayloadLen]
+	inner, err := crypto.Decrypt(storedPayload, kpBob.EncryptionIdentity)
 	if err != nil {
 		t.Fatalf("decrypt payload: %v", err)
 	}
@@ -233,7 +247,7 @@ func TestShareContainerRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := crypto.Decrypt(parsed.Payload, kpEve.EncryptionIdentity); err == nil {
+	if _, err := crypto.Decrypt(storedPayload, kpEve.EncryptionIdentity); err == nil {
 		t.Fatal("decrypt with wrong key should fail")
 	}
 

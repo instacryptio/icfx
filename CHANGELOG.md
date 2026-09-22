@@ -1,6 +1,11 @@
 # CHANGELOG
 
 
+**v0.1.7 - 09-24-2026**
+
+- icfx container signing/verification refactor and hardening
+
+
 **v0.1.6 - 09-11-2026**
 
 - Pin goroutine to OS thread for macos

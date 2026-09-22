@@ -68,8 +68,9 @@ type SendResult struct {
 //
 // The container header is ALWAYS stripped before upload: the stored object
 // must not reveal filename or sender fingerprint to the storage operator.
-// v2 containers keep their encrypted inner metadata copy; a stripped v1
-// simply loses them (receive naming comes from the share record).
+// Profiles that seal the metadata keep their encrypted copy; a stripped
+// legacy public container simply loses it (receive naming comes from the
+// share record).
 func SendEncrypted(ctx context.Context, c *cloud.Client, to []Recipient, ciphertextPath string, opts SendOptions) (SendResult, error) {
 	return SendEncryptedProgress(ctx, c, to, ciphertextPath, opts, nil)
 }

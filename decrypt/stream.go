@@ -13,14 +13,18 @@ import (
 	"github.com/instacryptio/icfx/identity"
 )
 
-// DecryptAndVerifyStream streams an .icfx container from src to dst, verifying
-// any signature. v3 containers stream in CONSTANT MEMORY (a large file never
-// materializes in RAM); v1/v2 containers fall back to the buffered
-// DecryptAndVerify (their uint32 payload length caps them at ~4 GiB anyway).
-// Verification is advisory, exactly as DecryptAndVerify — the plaintext is
-// written to dst regardless of the outcome; callers inspect the VerifyResult.
+// DecryptAndVerifyStream decrypts the .icfx container in src to dst in constant
+// memory and verifies its signature. The plaintext is written regardless of
+// the outcome and the verdict is returned afterwards — for the current
+// profiles it cannot be known sooner, because the signature binds the
+// plaintext digest and that completes only with the last byte. Callers that
+// must not expose unverified plaintext therefore write dst to a temporary
+// location and promote it only once the VerifyResult is acceptable.
+//
+// Legacy profiles decrypt as they always did; if they claim a signature the
+// result is VerifyFailed without any check, since their scheme never bound the
+// plaintext and is no longer honoured.
 func DecryptAndVerifyStream(src io.ReadSeeker, dst io.Writer, u *identity.Unlocked, contactList []contacts.Contact) (VerifyResult, error) {
-	// Peek the version, then rewind.
 	head := make([]byte, format.HeaderPrefixLen)
 	if _, err := io.ReadFull(src, head); err != nil {
 		return VerifyResult{}, fmt.Errorf("reading ICFX header: %w", err)
@@ -32,68 +36,35 @@ func DecryptAndVerifyStream(src io.ReadSeeker, dst io.Writer, u *identity.Unlock
 	if _, err := src.Seek(0, io.SeekStart); err != nil {
 		return VerifyResult{}, err
 	}
-
-	// Buffered profiles (ProfilePublicBuffered / ProfilePrivateBuffered): their
-	// uint32 length caps size, so buffering is the pre-existing model.
-	if !profile.Streaming() {
-		data, err := io.ReadAll(src)
-		if err != nil {
-			return VerifyResult{}, err
-		}
-		res, err := DecryptAndVerify(data, u, contactList)
-		if err != nil {
-			return VerifyResult{}, err
-		}
-		if _, err := dst.Write(res.Plaintext); err != nil {
-			return VerifyResult{}, err
-		}
-		return res.Verify, nil
+	switch {
+	case !profile.Streaming():
+		return decryptLegacyBuffered(src, dst, u)
+	case profile.Legacy():
+		return decryptLegacyStreaming(src, dst, u)
 	}
+	return decryptContainer(src, dst, u, contactList)
+}
 
-	// --- Streaming profiles: two passes over the ciphertext, constant memory ---
+// decryptContainer handles ProfilePrivate / ProfilePublic: one pass over the
+// payload that hashes the ciphertext going into age and the plaintext coming
+// out, then verifies crypto.SignedMessage against the signer named by the
+// sealed metadata.
+func decryptContainer(src io.ReadSeeker, dst io.Writer, u *identity.Unlocked, contactList []contacts.Contact) (VerifyResult, error) {
 	sh, err := format.ParseStreamHeader(src)
 	if err != nil {
-		return VerifyResult{}, fmt.Errorf("parsing streaming container: %w", err)
+		return VerifyResult{}, fmt.Errorf("parsing container: %w", err)
 	}
-
-	// PASS 1: streaming SHA-512 over the ciphertext payload → digest.
+	if sh.Profile == format.ProfilePrivate && !sh.Private {
+		return VerifyResult{}, fmt.Errorf("parsing container: private profile carries a header: %w", format.ErrInvalidFormat)
+	}
 	if _, err := src.Seek(sh.PayloadStart, io.SeekStart); err != nil {
 		return VerifyResult{}, err
 	}
-	h := crypto.NewV3Digest()
-	if _, err := io.CopyN(h, src, sh.PayloadLen); err != nil {
-		return VerifyResult{}, fmt.Errorf("hashing payload: %w", err)
-	}
-	digest := h.Sum(nil)
 
-	// Public profile (ProfilePublicStreaming): the signer fingerprint is in the
-	// plaintext header, so we can verify BEFORE decrypting; the payload is the
-	// bare file bytes (no inner metadata), streamed straight to dst.
-	if sh.Profile.Public() {
-		verify := VerifyResult{Status: VerifyUnsigned}
-		if sh.HeaderMeta.IsSigned && len(sh.Signature) > 0 {
-			verify = verifySignature(crypto.V3SignedMessage(digest), sh.Signature, sh.HeaderMeta.SenderFingerprint, u, contactList)
-		}
-		if _, err := src.Seek(sh.PayloadStart, io.SeekStart); err != nil {
-			return VerifyResult{}, err
-		}
-		pr, err := u.DecryptStream(io.LimitReader(src, sh.PayloadLen))
-		if err != nil {
-			return VerifyResult{}, fmt.Errorf("decrypting payload: %w", err)
-		}
-		if _, err := io.Copy(dst, pr); err != nil {
-			return VerifyResult{}, fmt.Errorf("writing plaintext: %w", err)
-		}
-		return verify, nil
-	}
-
-	// Private profile (ProfilePrivateStreaming). PASS 2: decrypt the payload.
-	// Read the inner metadata (signer fingerprint) off the front, verify the
-	// signature (before any file bytes reach dst), then stream the file bytes out.
-	if _, err := src.Seek(sh.PayloadStart, io.SeekStart); err != nil {
-		return VerifyResult{}, err
-	}
-	pr, err := u.DecryptStream(io.LimitReader(src, sh.PayloadLen))
+	ctDigest := crypto.NewContainerDigest()
+	ptDigest := crypto.NewContainerDigest()
+	payload := io.LimitReader(src, sh.PayloadLen)
+	pr, err := u.DecryptStream(io.TeeReader(payload, ctDigest))
 	if err != nil {
 		return VerifyResult{}, fmt.Errorf("decrypting payload: %w", err)
 	}
@@ -101,22 +72,109 @@ func DecryptAndVerifyStream(src io.ReadSeeker, dst io.Writer, u *identity.Unlock
 	if err != nil {
 		return VerifyResult{}, fmt.Errorf("reading inner metadata: %w", err)
 	}
-
-	verify := VerifyResult{Status: VerifyUnsigned}
-	if meta.IsSigned && len(sh.Signature) > 0 {
-		// Reuse the shared verify policy (contact→revoked→self); the message is
-		// the domain-separated digest instead of the whole ciphertext.
-		verify = verifySignature(crypto.V3SignedMessage(digest), sh.Signature, meta.SenderFingerprint, u, contactList)
+	if _, err := io.Copy(dst, io.TeeReader(pr, ptDigest)); err != nil {
+		return VerifyResult{}, fmt.Errorf("writing plaintext: %w", err)
 	}
+	// age stops reading at its final chunk; hash whatever payload bytes it
+	// left unread so the digest covers the payload exactly as written.
+	if _, err := io.Copy(ctDigest, payload); err != nil {
+		return VerifyResult{}, fmt.Errorf("hashing payload: %w", err)
+	}
+	return verdict(sh, meta, ptDigest.Sum(nil), ctDigest.Sum(nil), u, contactList), nil
+}
 
+// verdict decides the VerifyResult for a decrypted container. The sealed
+// metadata is the only authority on whether the container is signed and by
+// whom; every inconsistency between it and what is on the wire is a failure.
+func verdict(sh *format.StreamHeader, meta format.Metadata, plaintextDigest, ciphertextDigest []byte, u *identity.Unlocked, contactList []contacts.Contact) VerifyResult {
+	if !meta.IsSigned {
+		if len(sh.Signature) > 0 {
+			// Nobody may bolt a signature onto a file its author left unsigned.
+			return VerifyResult{Status: VerifyFailed}
+		}
+		return VerifyResult{Status: VerifyUnsigned}
+	}
+	failed := VerifyResult{Status: VerifyFailed, SignerFP: meta.SenderFingerprint}
+	switch {
+	case meta.SenderFingerprint == "":
+		return failed // signed but names no signer: malformed
+	case len(sh.Signature) == 0:
+		return failed // signature stripped
+	case !sh.Private && !sh.HeaderMeta.Equal(meta):
+		return failed // advisory header disagrees with the sealed copy
+	}
+	return verifySignature(crypto.SignedMessage(byte(sh.Profile), plaintextDigest, ciphertextDigest), sh.Signature, meta.SenderFingerprint, u, contactList)
+}
+
+// decryptLegacyBuffered decrypts a LegacyProfilePublicBuffered /
+// LegacyProfilePrivateBuffered container (uint32 payload length, whole
+// ciphertext in memory).
+func decryptLegacyBuffered(src io.Reader, dst io.Writer, u *identity.Unlocked) (VerifyResult, error) {
+	data, err := io.ReadAll(src)
+	if err != nil {
+		return VerifyResult{}, err
+	}
+	c, err := format.Deserialize(data)
+	if err != nil {
+		return VerifyResult{}, fmt.Errorf("parsing ICFX container: %w", err)
+	}
+	plaintext, err := u.Decrypt(c.Payload)
+	if err != nil {
+		return VerifyResult{}, fmt.Errorf("decrypting payload: %w", err)
+	}
+	meta, filedata := c.Metadata, plaintext
+	if c.Profile.SealsMetadata() {
+		meta, filedata, err = format.DecodePayload(plaintext)
+		if err != nil {
+			return VerifyResult{}, fmt.Errorf("parsing inner metadata: %w", err)
+		}
+	}
+	if _, err := dst.Write(filedata); err != nil {
+		return VerifyResult{}, fmt.Errorf("writing plaintext: %w", err)
+	}
+	return legacyVerdict(meta, c.Signature), nil
+}
+
+// decryptLegacyStreaming decrypts a LegacyProfilePrivateStreaming /
+// LegacyProfilePublicStreaming container in constant memory.
+func decryptLegacyStreaming(src io.ReadSeeker, dst io.Writer, u *identity.Unlocked) (VerifyResult, error) {
+	sh, err := format.ParseStreamHeader(src)
+	if err != nil {
+		return VerifyResult{}, fmt.Errorf("parsing container: %w", err)
+	}
+	if _, err := src.Seek(sh.PayloadStart, io.SeekStart); err != nil {
+		return VerifyResult{}, err
+	}
+	pr, err := u.DecryptStream(io.LimitReader(src, sh.PayloadLen))
+	if err != nil {
+		return VerifyResult{}, fmt.Errorf("decrypting payload: %w", err)
+	}
+	meta := sh.HeaderMeta
+	if sh.Profile.SealsMetadata() {
+		meta, err = readInnerMeta(pr)
+		if err != nil {
+			return VerifyResult{}, fmt.Errorf("reading inner metadata: %w", err)
+		}
+	}
 	if _, err := io.Copy(dst, pr); err != nil {
 		return VerifyResult{}, fmt.Errorf("writing plaintext: %w", err)
 	}
-	return verify, nil
+	return legacyVerdict(meta, sh.Signature), nil
+}
+
+// legacyVerdict: legacy signatures bound only the ciphertext and are no longer
+// honoured, so anything that claims to be signed fails. The claimed signer
+// fingerprint (if the layout carried one) is reported so the caller can say
+// who the file said it was from.
+func legacyVerdict(meta format.Metadata, signature []byte) VerifyResult {
+	if !meta.IsSigned && len(signature) == 0 {
+		return VerifyResult{Status: VerifyUnsigned}
+	}
+	return VerifyResult{Status: VerifyFailed, SignerFP: meta.SenderFingerprint}
 }
 
 // readInnerMeta reads the uint16-length-prefixed inner metadata off the front of
-// a decrypted v2/v3 payload stream, leaving r positioned at the file bytes.
+// a decrypted payload stream, leaving r positioned at the file bytes.
 func readInnerMeta(r io.Reader) (format.Metadata, error) {
 	var lenbuf [2]byte
 	if _, err := io.ReadFull(r, lenbuf[:]); err != nil {
@@ -150,10 +208,11 @@ func decryptToWriter(isContainer bool, src io.ReadSeeker, dst io.Writer, u *iden
 	return VerifyResult{Status: VerifyUnsigned}, nil
 }
 
-// DecryptFile streams the .icfx (or bare-age) file at inPath to outPath. v3
-// containers decrypt in constant memory. It overwrites outPath; callers enforce
-// their own overwrite/force policy and atomic-rename if needed. Returns the
-// verification outcome (VerifyUnsigned for bare-age input).
+// DecryptFile streams the .icfx (or bare-age) file at inPath to outPath in
+// constant memory. It overwrites outPath; callers enforce their own overwrite
+// policy. The verdict arrives after the plaintext is on disk (see
+// DecryptAndVerifyStream), so callers that gate on it should pass a temporary
+// outPath and promote it themselves. Returns VerifyUnsigned for bare-age input.
 func DecryptFile(inPath, outPath string, u *identity.Unlocked, contactList []contacts.Contact) (VerifyResult, error) {
 	in, err := os.Open(inPath)
 	if err != nil {
