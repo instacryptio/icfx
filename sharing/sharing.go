@@ -68,8 +68,9 @@ type SendResult struct {
 //
 // The container header is ALWAYS stripped before upload: the stored object
 // must not reveal filename or sender fingerprint to the storage operator.
-// v2 containers keep their encrypted inner metadata copy; a stripped v1
-// simply loses them (receive naming comes from the share record).
+// Profiles that seal the metadata keep their encrypted copy; a stripped
+// legacy public container simply loses it (receive naming comes from the
+// share record).
 func SendEncrypted(ctx context.Context, c *cloud.Client, to []Recipient, ciphertextPath string, opts SendOptions) (SendResult, error) {
 	return SendEncryptedProgress(ctx, c, to, ciphertextPath, opts, nil)
 }
@@ -104,8 +105,9 @@ func SendEncryptedProgress(ctx context.Context, c *cloud.Client, to []Recipient,
 
 	// Streaming header strip: replace the fixed prefix with a zero-length
 	// header marker and skip the plaintext metadata block; payload and
-	// signature bytes stream through untouched (the signature covers only
-	// the payload, so it stays valid).
+	// signature bytes stream through untouched. The signature never covers
+	// the header (it binds the profile, the plaintext and the ciphertext), and
+	// the metadata it needs is sealed inside the payload, so it stays valid.
 	head := make([]byte, format.HeaderPrefixLen)
 	if _, err := io.ReadFull(f, head); err != nil {
 		return SendResult{}, fmt.Errorf("reading container header: %w", err)

@@ -13,8 +13,8 @@ A Go library providing post-quantum ready encryption, signing, key management, a
 - Hybrid post-quantum encryption ([Age](https://github.com/FiloSottile/age) X25519 + ML-KEM-768)
 - Digital signatures (ML-DSA-65 / FIPS 204)
 - Git commit signing (post-quantum ML-DSA-65 signatures via `GitSign`) — a drop-in for git's `gpg.program`
-- `.icfx` binary container format (metadata + payload + signature) across four format profiles
-- Constant-memory streaming encryption for large files (digest-signed)
+- `.icfx` binary container format: sealed metadata + payload + a signature that binds the plaintext, the ciphertext and the profile
+- Constant-memory streaming encryption and verification for large files
 - Container decrypt with signature verification (against current keys, rotated-out keys, and self)
 - Encrypted file sharing (upload/download of pre-encrypted `.icfx` ciphertext)
 - Contact groups / multi-recipient encryption
@@ -40,7 +40,7 @@ A Go library providing post-quantum ready encryption, signing, key management, a
 |---------|-------------|
 | `crypto` | Hybrid encryption (Age + ML-KEM-768), ML-DSA-65 signing, git commit signing, key generation, 128-bit fingerprinting |
 | `format` | ICFX binary container format, Age format support, PEM armor, format detection |
-| `encrypt` | Produces `.icfx` containers across all four format profiles, including constant-memory digest-signed streaming |
+| `encrypt` | Produces `.icfx` containers (private by default, or with an advisory public header) in constant memory, signing plaintext + ciphertext + profile |
 | `decrypt` | Container-aware decrypt and signature verification (resolves the signer against contacts, rotated-out keys, and self) |
 | `recipient` | Resolves a recipient reference (alias, email, nickname, contact, own identity, or raw `age1pq1` lock) to key material, with one shared resolution order across clients |
 | `identity` | Encrypted identity store, primary identity enforcement, and `Unlocked` operations API (memguard-backed Sign/Decrypt/Encrypt/GitSign/Export) |

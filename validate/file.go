@@ -1,13 +1,14 @@
 package validate
 
 import (
+	"bytes"
 	"fmt"
 
 	"github.com/instacryptio/icfx/format"
 )
 
-// ValidateICFXFile checks that data is a valid encrypted file (ICFX, Age, or Armored format).
-// This performs structural validation only — it does NOT decrypt the data.
+// ValidateICFXFile checks that data is a structurally valid encrypted file
+// (ICFX, Age, or Armored format). It does NOT decrypt the data.
 func ValidateICFXFile(data []byte) error {
 	if len(data) == 0 {
 		return fmt.Errorf("file is empty")
@@ -16,7 +17,7 @@ func ValidateICFXFile(data []byte) error {
 	detected := format.Detect(data)
 	switch detected {
 	case format.FormatICFX:
-		if _, err := format.Deserialize(data); err != nil {
+		if err := validateContainer(data); err != nil {
 			return fmt.Errorf("invalid ICFX file: %w", err)
 		}
 		return nil
@@ -31,4 +32,22 @@ func ValidateICFXFile(data []byte) error {
 	default:
 		return fmt.Errorf("unrecognized file format: not an ICFX, Age, or armored file")
 	}
+}
+
+// validateContainer parses the container framing for whichever layout the
+// profile byte selects.
+func validateContainer(data []byte) error {
+	if len(data) < format.HeaderPrefixLen {
+		return format.ErrInvalidFormat
+	}
+	profile, _, err := format.ParseHeaderPrefix(data[:format.HeaderPrefixLen])
+	if err != nil {
+		return err
+	}
+	if !profile.Streaming() {
+		_, err := format.Deserialize(data)
+		return err
+	}
+	_, err = format.ParseStreamHeader(bytes.NewReader(data))
+	return err
 }

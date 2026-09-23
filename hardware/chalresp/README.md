@@ -45,6 +45,17 @@ challenge-response — the earlier "NitroKey Pro/Storage" claim was never real).
 `Open`/`Challenge`/`IsSlot2Programmed` route to the transport the device was
 found on. PC/SC enumeration is best-effort — a missing `pcscd` never breaks HID.
 
+## Threading
+
+Every hidapi call — init, enumerate, open, feature-report I/O, close — runs on
+one goroutine that is locked to an OS thread for the life of the process
+(`hidRun` in `chalresp_hid.go`). hidapi's macOS backend binds its
+process-global `IOHIDManager` to the run loop of the thread that initialised
+it and enumerates by pumping the *calling* thread's run loop, so calls from
+arbitrary threads can silently see no devices; confining them to one thread
+makes the run loop always the right one. The public API is unchanged;
+callers need no pinning of their own.
+
 ## Mobile (Android / iOS) is out of scope
 
 The desktop files are `//go:build !android && !ios && !nohw`; mobile uses the

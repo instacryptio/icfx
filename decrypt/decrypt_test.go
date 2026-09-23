@@ -3,12 +3,15 @@ package decrypt
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/instacryptio/icfx/contacts"
 	"github.com/instacryptio/icfx/crypto"
+	"github.com/instacryptio/icfx/encrypt"
 	"github.com/instacryptio/icfx/format"
 	"github.com/instacryptio/icfx/identity"
 )
@@ -75,6 +78,22 @@ func newParty(t *testing.T, name string) *party {
 	if err != nil {
 		t.Fatalf("generating keypair: %v", err)
 	}
+	return unlockParty(t, name, kp, kp.Fingerprint)
+}
+
+// newPartyWithFingerprint is newParty with the identity's recorded fingerprint
+// replaced — for exercising a store whose metadata is wrong or missing.
+func newPartyWithFingerprint(t *testing.T, name, fingerprint string) *party {
+	t.Helper()
+	kp, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("generating keypair: %v", err)
+	}
+	return unlockParty(t, name, kp, fingerprint)
+}
+
+func unlockParty(t *testing.T, name string, kp *crypto.KeyPair, fingerprint string) *party {
+	t.Helper()
 	ks := newMemKeystore()
 	if err := ks.StoreEncryptionIdentity(name, kp.EncryptionIdentity); err != nil {
 		t.Fatal(err)
@@ -86,7 +105,7 @@ func newParty(t *testing.T, name string) *party {
 		Name:        name,
 		EncPubKey:   kp.EncryptionRecipient,
 		SignPubKey:  base64.StdEncoding.EncodeToString(kp.SigningPublicKey),
-		Fingerprint: kp.Fingerprint,
+		Fingerprint: fingerprint,
 		Status:      "active",
 	}
 	u, err := identity.Unlock(ks, info)
@@ -106,141 +125,160 @@ func contactFor(alias string, sender *party) contacts.Contact {
 	}
 }
 
-type buildOpts struct {
-	profile          format.Profile
-	private          bool
-	signed           bool
-	sender           *party
-	recipient        *party
-	headerFPOverride string // set a header SenderFingerprint that differs from the inner one
-	innerFPOverride  string // set the inner/authoritative SenderFingerprint
+func testMeta(sender *party, signed bool) format.Metadata {
+	return format.Metadata{
+		SenderFingerprint: sender.kp.Fingerprint,
+		Timestamp:         time.Now().UTC().Truncate(time.Second),
+		OriginalFilename:  "test.bin",
+		IsSigned:          signed,
+	}
 }
 
-// buildContainer produces a serialized .icfx container exactly as the buffered
-// encrypt flow does: a private profile seals inner metadata into the payload; a
-// public profile leaves the payload bare. Then age-encrypt to the recipient,
-// sign the ciphertext, and serialize.
-func buildContainer(t *testing.T, filedata []byte, o buildOpts) []byte {
+// encryptContainer produces a container through the real writer.
+func encryptContainer(t *testing.T, sender, recipient *party, filedata []byte, profile format.Profile, signed bool) []byte {
 	t.Helper()
-	if o.profile == 0 {
-		o.profile = format.ProfilePrivateBuffered
+	var signer *identity.Unlocked
+	if signed {
+		signer = sender.u
 	}
-	innerFP := o.sender.kp.Fingerprint
-	if o.innerFPOverride != "" {
-		innerFP = o.innerFPOverride
+	var buf bytes.Buffer
+	if err := encrypt.EncryptStream(&buf, bytes.NewReader(filedata), []string{recipient.kp.EncryptionRecipient}, signer, testMeta(sender, signed), profile); err != nil {
+		t.Fatalf("EncryptStream: %v", err)
 	}
-	meta := format.Metadata{SenderFingerprint: innerFP, OriginalFilename: "test.txt", IsSigned: o.signed}
-
-	payloadPlain := filedata
-	if !o.profile.Public() {
-		enc, err := format.EncodePayload(meta, filedata)
-		if err != nil {
-			t.Fatalf("encode payload: %v", err)
-		}
-		payloadPlain = enc
+	out := buf.Bytes()
+	if out[4] != byte(profile) {
+		t.Fatalf("expected profile byte %#x, got %#x", byte(profile), out[4])
 	}
-	ciphertext, err := crypto.Encrypt(payloadPlain, []string{o.recipient.kp.EncryptionRecipient})
-	if err != nil {
-		t.Fatalf("encrypt: %v", err)
-	}
-	var sig []byte
-	if o.signed {
-		sig, err = crypto.Sign(ciphertext, o.sender.kp.SigningPrivateKey)
-		if err != nil {
-			t.Fatalf("sign: %v", err)
-		}
-	}
-	c := &format.Container{Profile: o.profile, Payload: ciphertext, Signature: sig, Private: o.private}
-	if !o.private {
-		hdr := meta
-		if o.headerFPOverride != "" {
-			hdr.SenderFingerprint = o.headerFPOverride
-		}
-		c.Metadata = hdr
-	}
-	data, err := c.Serialize()
-	if err != nil {
-		t.Fatalf("serialize: %v", err)
-	}
-	return data
+	return out
 }
 
-// --- tests ------------------------------------------------------------------
+func decryptContainerBytes(t *testing.T, container []byte, u *identity.Unlocked, cl []contacts.Contact) ([]byte, VerifyResult) {
+	t.Helper()
+	var out bytes.Buffer
+	res, err := DecryptAndVerifyStream(bytes.NewReader(container), &out, u, cl)
+	if err != nil {
+		t.Fatalf("DecryptAndVerifyStream: %v", err)
+	}
+	return out.Bytes(), res
+}
 
-func TestUnsignedContainer(t *testing.T) {
-	sender, recipient := newParty(t, "sender"), newParty(t, "recipient")
-	file := []byte("hello world")
-	data := buildContainer(t, file, buildOpts{signed: false, sender: sender, recipient: recipient})
+// parts is a streaming container taken apart so tests can tamper with one
+// field and put it back together.
+type parts struct {
+	profile    format.Profile
+	headerMeta []byte
+	payload    []byte
+	signature  []byte
+}
 
-	res, err := DecryptAndVerify(data, recipient.u, nil)
+func split(t *testing.T, data []byte) parts {
+	t.Helper()
+	profile, metaLen, err := format.ParseHeaderPrefix(data[:format.HeaderPrefixLen])
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(res.Plaintext, file) {
-		t.Fatalf("plaintext mismatch: %q", res.Plaintext)
+	off := format.HeaderPrefixLen
+	p := parts{profile: profile, headerMeta: append([]byte{}, data[off:off+metaLen]...)}
+	off += metaLen
+	plen := int(binary.BigEndian.Uint64(data[off : off+8]))
+	off += 8
+	p.payload = append([]byte{}, data[off:off+plen]...)
+	off += plen
+	slen := int(binary.BigEndian.Uint16(data[off : off+2]))
+	off += 2
+	p.signature = append([]byte{}, data[off:off+slen]...)
+	return p
+}
+
+func (p parts) join() []byte {
+	buf := append([]byte{}, format.MagicBytes...)
+	buf = append(buf, byte(p.profile))
+	buf = binary.BigEndian.AppendUint16(buf, uint16(len(p.headerMeta)))
+	buf = append(buf, p.headerMeta...)
+	buf = binary.BigEndian.AppendUint64(buf, uint64(len(p.payload)))
+	buf = append(buf, p.payload...)
+	buf = binary.BigEndian.AppendUint16(buf, uint16(len(p.signature)))
+	return append(buf, p.signature...)
+}
+
+func digest(b []byte) []byte {
+	h := crypto.NewContainerDigest()
+	h.Write(b)
+	return h.Sum(nil)
+}
+
+// --- round trips --------------------------------------------------------------
+
+func TestPrivateSignedContactMatch(t *testing.T) {
+	sender, recipient := newParty(t, "sender"), newParty(t, "recipient")
+	file := []byte("private payload")
+	data := encryptContainer(t, sender, recipient, file, format.ProfilePrivate, true)
+	if bytes.Contains(data, []byte("test.bin")) || bytes.Contains(data, []byte(sender.kp.Fingerprint)) {
+		t.Fatal("private container leaked metadata")
 	}
-	if res.Verify.Status != VerifyUnsigned {
-		t.Fatalf("want VerifyUnsigned, got %v", res.Verify.Status)
+
+	plain, res := decryptContainerBytes(t, data, recipient.u, []contacts.Contact{contactFor("alice", sender)})
+	if !bytes.Equal(plain, file) {
+		t.Fatalf("plaintext mismatch: %q", plain)
+	}
+	if res.Status != VerifyOK || res.SignerAlias != "alice" || res.UsedRevokedKey || res.SignerFP != sender.kp.Fingerprint {
+		t.Fatalf("want OK via contact alice, got %+v", res)
 	}
 }
 
-func TestPrivateV2SignedContactMatch(t *testing.T) {
+func TestPublicSignedContactMatch(t *testing.T) {
 	sender, recipient := newParty(t, "sender"), newParty(t, "recipient")
-	file := []byte("private v2 payload")
-	data := buildContainer(t, file, buildOpts{private: true, signed: true, sender: sender, recipient: recipient})
+	file := []byte("public-header payload")
+	data := encryptContainer(t, sender, recipient, file, format.ProfilePublic, true)
+	if !bytes.Contains(data, []byte("test.bin")) {
+		t.Fatal("public container should carry the advisory header")
+	}
 
-	res, err := DecryptAndVerify(data, recipient.u, []contacts.Contact{contactFor("alice", sender)})
-	if err != nil {
-		t.Fatal(err)
+	plain, res := decryptContainerBytes(t, data, recipient.u, []contacts.Contact{contactFor("bob", sender)})
+	if !bytes.Equal(plain, file) {
+		t.Fatal("plaintext mismatch")
 	}
-	if !bytes.Equal(res.Plaintext, file) {
-		t.Fatalf("plaintext mismatch")
-	}
-	if res.Verify.Status != VerifyOK || res.Verify.SignerAlias != "alice" || res.Verify.UsedRevokedKey {
-		t.Fatalf("want OK via contact alice, got %+v", res.Verify)
-	}
-}
-
-func TestPublicV2SignedContactMatch(t *testing.T) {
-	sender, recipient := newParty(t, "sender"), newParty(t, "recipient")
-	file := []byte("public-meta v2")
-	data := buildContainer(t, file, buildOpts{private: false, signed: true, sender: sender, recipient: recipient})
-
-	res, err := DecryptAndVerify(data, recipient.u, []contacts.Contact{contactFor("bob", sender)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.Verify.Status != VerifyOK || res.Verify.SignerAlias != "bob" {
-		t.Fatalf("want OK via contact bob, got %+v", res.Verify)
+	if res.Status != VerifyOK || res.SignerAlias != "bob" {
+		t.Fatalf("want OK via contact bob, got %+v", res)
 	}
 }
 
 func TestSelfSigned(t *testing.T) {
-	// Sender is also the recipient (encrypt-to-self); no contacts.
 	self := newParty(t, "me")
 	file := []byte("dear diary")
-	data := buildContainer(t, file, buildOpts{private: true, signed: true, sender: self, recipient: self})
+	data := encryptContainer(t, self, self, file, format.ProfilePrivate, true)
 
-	res, err := DecryptAndVerify(data, self.u, nil)
-	if err != nil {
-		t.Fatal(err)
+	plain, res := decryptContainerBytes(t, data, self.u, nil)
+	if !bytes.Equal(plain, file) {
+		t.Fatal("plaintext mismatch")
 	}
-	if res.Verify.Status != VerifyOK || res.Verify.SignerIdentity != "me" {
-		t.Fatalf("want OK via self identity, got %+v", res.Verify)
+	if res.Status != VerifyOK || res.SignerIdentity != "me" {
+		t.Fatalf("want OK via self, got %+v", res)
 	}
 }
 
-func TestUnverifiableUnknownSender(t *testing.T) {
+func TestUnsigned(t *testing.T) {
 	sender, recipient := newParty(t, "sender"), newParty(t, "recipient")
-	data := buildContainer(t, []byte("x"), buildOpts{private: true, signed: true, sender: sender, recipient: recipient})
-
-	// No contacts, recipient != sender → cannot resolve a signer key.
-	res, err := DecryptAndVerify(data, recipient.u, nil)
-	if err != nil {
-		t.Fatal(err)
+	file := []byte("no signature here")
+	for _, p := range []format.Profile{format.ProfilePrivate, format.ProfilePublic} {
+		data := encryptContainer(t, sender, recipient, file, p, false)
+		plain, res := decryptContainerBytes(t, data, recipient.u, nil)
+		if !bytes.Equal(plain, file) {
+			t.Fatal("plaintext mismatch")
+		}
+		if res.Status != VerifyUnsigned {
+			t.Fatalf("profile %#x: want VerifyUnsigned, got %+v", byte(p), res)
+		}
 	}
-	if res.Verify.Status != VerifyUnverifiable || res.Verify.SignerFP != sender.kp.Fingerprint {
-		t.Fatalf("want Unverifiable with signer fp, got %+v", res.Verify)
+}
+
+func TestUnknownSigner(t *testing.T) {
+	sender, recipient := newParty(t, "sender"), newParty(t, "recipient")
+	data := encryptContainer(t, sender, recipient, []byte("x"), format.ProfilePrivate, true)
+
+	_, res := decryptContainerBytes(t, data, recipient.u, nil) // no contacts, recipient != sender
+	if res.Status != VerifyUnknownSigner || res.SignerFP != sender.kp.Fingerprint {
+		t.Fatalf("want UnknownSigner with signer fp, got %+v", res)
 	}
 }
 
@@ -252,7 +290,7 @@ func TestRevokedPreviousKey(t *testing.T) {
 	}
 	revokedAt := time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC)
 	// File was signed with the OLD key; the contact has since rotated.
-	data := buildContainer(t, []byte("signed before rotation"), buildOpts{private: true, signed: true, sender: oldSender, recipient: recipient})
+	data := encryptContainer(t, oldSender, recipient, []byte("signed before rotation"), format.ProfilePrivate, true)
 	contact := contacts.Contact{
 		Alias:       "carol",
 		Fingerprint: newKP.Fingerprint, // current key
@@ -264,105 +302,88 @@ func TestRevokedPreviousKey(t *testing.T) {
 		}},
 	}
 
-	res, err := DecryptAndVerify(data, recipient.u, []contacts.Contact{contact})
-	if err != nil {
-		t.Fatal(err)
+	_, res := decryptContainerBytes(t, data, recipient.u, []contacts.Contact{contact})
+	if res.Status != VerifyOK || !res.UsedRevokedKey || res.SignerAlias != "carol" {
+		t.Fatalf("want OK via revoked key, got %+v", res)
 	}
-	if res.Verify.Status != VerifyOK || !res.Verify.UsedRevokedKey || res.Verify.SignerAlias != "carol" {
-		t.Fatalf("want OK via revoked key, got %+v", res.Verify)
-	}
-	if !res.Verify.RevokedAt.Equal(revokedAt) {
-		t.Fatalf("want RevokedAt %v, got %v", revokedAt, res.Verify.RevokedAt)
+	if !res.RevokedAt.Equal(revokedAt) {
+		t.Fatalf("want RevokedAt %v, got %v", revokedAt, res.RevokedAt)
 	}
 }
 
-func TestTamperedSignature(t *testing.T) {
+func TestInMemoryFormMatchesStream(t *testing.T) {
 	sender, recipient := newParty(t, "sender"), newParty(t, "recipient")
-	data := buildContainer(t, []byte("payload"), buildOpts{private: true, signed: true, sender: sender, recipient: recipient})
-
-	// Flip a byte inside the trailing signature block.
-	tampered := make([]byte, len(data))
-	copy(tampered, data)
-	tampered[len(tampered)-1] ^= 0xFF
-
-	res, err := DecryptAndVerify(tampered, recipient.u, []contacts.Contact{contactFor("alice", sender)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.Verify.Status != VerifyUnverifiable {
-		t.Fatalf("want Unverifiable for tampered sig, got %+v", res.Verify)
-	}
-}
-
-func TestInnerMetaIsAuthoritative(t *testing.T) {
-	// A v2 public-meta container whose plaintext HEADER names a bogus signer,
-	// while the authenticated INNER metadata names the true sender. Verification
-	// must key off the inner metadata and succeed.
-	sender, recipient := newParty(t, "sender"), newParty(t, "recipient")
-	data := buildContainer(t, []byte("trust the inside"), buildOpts{
-		private: false, signed: true, sender: sender, recipient: recipient,
-		headerFPOverride: "00000000000000000000000000000000",
-	})
+	file := []byte("same answer either way")
+	data := encryptContainer(t, sender, recipient, file, format.ProfilePrivate, true)
 
 	res, err := DecryptAndVerify(data, recipient.u, []contacts.Contact{contactFor("alice", sender)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Verify.Status != VerifyOK || res.Verify.SignerAlias != "alice" {
-		t.Fatalf("inner meta must win: got %+v", res.Verify)
+	if !bytes.Equal(res.Plaintext, file) || res.Verify.Status != VerifyOK || res.Verify.SignerAlias != "alice" {
+		t.Fatalf("in-memory form: %+v", res.Verify)
 	}
 }
 
-func TestForgedInnerMetaFailsVerify(t *testing.T) {
-	// Inner metadata claims a DIFFERENT sender than the one who actually signed;
-	// the signature over the payload won't verify against that claimed key.
-	realSigner, recipient := newParty(t, "real"), newParty(t, "recipient")
+func TestPublicHeaderReadableWithoutDecrypt(t *testing.T) {
+	sender, recipient := newParty(t, "sender"), newParty(t, "recipient")
+	data := encryptContainer(t, sender, recipient, []byte("scriptable"), format.ProfilePublic, true)
+
+	sh, err := format.ParseStreamHeader(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("ParseStreamHeader: %v", err)
+	}
+	if sh.Profile != format.ProfilePublic || sh.Private {
+		t.Fatalf("want public profile with header, got %#x private=%v", byte(sh.Profile), sh.Private)
+	}
+	if sh.HeaderMeta.OriginalFilename != "test.bin" || sh.HeaderMeta.SenderFingerprint != sender.kp.Fingerprint {
+		t.Fatalf("header metadata not readable without decrypting: %+v", sh.HeaderMeta)
+	}
+}
+
+// --- writer contract ---------------------------------------------------------
+
+func TestEncryptRejectsLegacyProfiles(t *testing.T) {
+	sender, recipient := newParty(t, "sender"), newParty(t, "recipient")
+	for _, p := range []format.Profile{format.LegacyProfilePublicBuffered, format.LegacyProfilePrivateBuffered, format.LegacyProfilePrivateStreaming, format.LegacyProfilePublicStreaming, format.Profile(0x07)} {
+		var buf bytes.Buffer
+		err := encrypt.EncryptStream(&buf, strings.NewReader("x"), []string{recipient.kp.EncryptionRecipient}, sender.u, testMeta(sender, true), p)
+		if err == nil {
+			t.Fatalf("profile %#x must not be writable", byte(p))
+		}
+	}
+}
+
+func TestSenderFingerprintFollowsSigner(t *testing.T) {
+	sender, recipient := newParty(t, "sender"), newParty(t, "recipient")
 	impostor := newParty(t, "impostor")
-	data := buildContainer(t, []byte("who signed this?"), buildOpts{
-		private: true, signed: true, sender: realSigner, recipient: recipient,
-		innerFPOverride: impostor.kp.Fingerprint,
-	})
 
-	res, err := DecryptAndVerify(data, recipient.u, []contacts.Contact{contactFor("impostor", impostor)})
-	if err != nil {
+	// An empty fingerprint is filled from the signer.
+	meta := testMeta(sender, true)
+	meta.SenderFingerprint = ""
+	var buf bytes.Buffer
+	if err := encrypt.EncryptStream(&buf, strings.NewReader("x"), []string{recipient.kp.EncryptionRecipient}, sender.u, meta, format.ProfilePrivate); err != nil {
 		t.Fatal(err)
 	}
-	if res.Verify.Status != VerifyUnverifiable {
-		t.Fatalf("forged inner-meta signer must not verify, got %+v", res.Verify)
+	if _, res := decryptContainerBytes(t, buf.Bytes(), recipient.u, []contacts.Contact{contactFor("alice", sender)}); res.Status != VerifyOK || res.SignerFP != sender.kp.Fingerprint {
+		t.Fatalf("want OK with the signer's fingerprint sealed, got %+v", res)
+	}
+
+	// A fingerprint naming anyone but the signer is refused outright.
+	meta.SenderFingerprint = impostor.kp.Fingerprint
+	if err := encrypt.EncryptStream(&bytes.Buffer{}, strings.NewReader("x"), []string{recipient.kp.EncryptionRecipient}, sender.u, meta, format.ProfilePrivate); err == nil {
+		t.Fatal("a sealed fingerprint that is not the signer's must be refused")
 	}
 }
 
-func TestHeaderedV1Signed(t *testing.T) {
+func TestWrongRecipientCannotDecrypt(t *testing.T) {
 	sender, recipient := newParty(t, "sender"), newParty(t, "recipient")
-	file := []byte("legacy v1")
-	data := buildContainer(t, file, buildOpts{profile: format.ProfilePublicBuffered, private: false, signed: true, sender: sender, recipient: recipient})
+	stranger := newParty(t, "stranger")
+	data := encryptContainer(t, sender, recipient, []byte("secret"), format.ProfilePrivate, true)
 
-	res, err := DecryptAndVerify(data, recipient.u, []contacts.Contact{contactFor("alice", sender)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(res.Plaintext, file) {
-		t.Fatalf("v1 plaintext mismatch")
-	}
-	if res.Verify.Status != VerifyOK || res.Verify.SignerAlias != "alice" {
-		t.Fatalf("want OK via header FP, got %+v", res.Verify)
-	}
-}
-
-func TestStrippedV1Private(t *testing.T) {
-	sender, recipient := newParty(t, "sender"), newParty(t, "recipient")
-	file := []byte("stripped legacy")
-	data := buildContainer(t, file, buildOpts{profile: format.ProfilePublicBuffered, private: true, signed: true, sender: sender, recipient: recipient})
-
-	res, err := DecryptAndVerify(data, recipient.u, []contacts.Contact{contactFor("alice", sender)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(res.Plaintext, file) {
-		t.Fatalf("stripped-v1 plaintext mismatch")
-	}
-	if res.Verify.Status != VerifyNoMetadata {
-		t.Fatalf("want NoMetadata for stripped v1, got %+v", res.Verify)
+	var out bytes.Buffer
+	if _, err := DecryptAndVerifyStream(bytes.NewReader(data), &out, stranger.u, nil); err == nil {
+		t.Fatal("want decrypt error for wrong recipient")
 	}
 }
 
@@ -371,14 +392,7 @@ func TestBadContainerErrors(t *testing.T) {
 	if _, err := DecryptAndVerify([]byte("not an icfx container"), recipient.u, nil); err == nil {
 		t.Fatal("want error for garbage input")
 	}
-}
-
-func TestWrongRecipientCannotDecrypt(t *testing.T) {
-	sender, recipient := newParty(t, "sender"), newParty(t, "recipient")
-	stranger := newParty(t, "stranger")
-	data := buildContainer(t, []byte("secret"), buildOpts{private: true, signed: true, sender: sender, recipient: recipient})
-
-	if _, err := DecryptAndVerify(data, stranger.u, nil); err == nil {
-		t.Fatal("want decrypt error for wrong recipient")
+	if _, err := DecryptAndVerify([]byte("ICFX\x09\x00\x00rest"), recipient.u, nil); !errors.Is(err, format.ErrUnsupportedProfile) {
+		t.Fatalf("unknown profile: want ErrUnsupportedProfile, got %v", err)
 	}
 }

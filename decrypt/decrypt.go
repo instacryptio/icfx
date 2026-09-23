@@ -1,25 +1,33 @@
 // Package decrypt is icfx's container-aware decrypt + signature-verification
 // path: it parses an .icfx container, decrypts it with the caller's unlocked
-// identity, and — when the container is signed — verifies the signature against
-// the caller's contacts (current keys, then rotated-out/previous keys) and
-// finally the unlocked identity itself. It is the single implementation shared
-// by every client (local decrypt, file-share receive, and signature checks), so
-// verification policy can never drift between them.
+// identity, and — when the sealed metadata says the container is signed —
+// verifies the signature against the caller's contacts (current keys, then
+// rotated-out/previous keys) and finally the unlocked identity itself. It is
+// the single implementation shared by every client (local decrypt, file-share
+// receive, and signature checks), so verification policy can never drift
+// between them.
 //
-// Signature verification is ADVISORY to decryption: an unverifiable signature
-// never blocks decryption (the plaintext is still returned). Callers inspect the
-// returned VerifyResult and decide how strict to be — a verify command exits
-// non-zero, while decrypt/receive surface a warning.
+// The signature covers the plaintext, the ciphertext and the profile byte
+// (crypto.SignedMessage), and the signer is resolved only from the metadata
+// sealed inside the ciphertext — never from a plaintext header. Verification
+// is therefore always post-decrypt, and for the streaming path the verdict is
+// known only after the last plaintext byte has been written to dst.
+//
+// The library never withholds plaintext: the bytes are always written and the
+// VerifyResult reports what was found. Callers gate on it — a VerifyFailed
+// means the file claims a signer it cannot prove, so clients decrypt to a
+// temporary location, ask the user, and only then promote or discard.
 package decrypt
 
 import (
+	"bytes"
 	"encoding/base64"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/instacryptio/icfx/contacts"
 	"github.com/instacryptio/icfx/crypto"
-	"github.com/instacryptio/icfx/format"
 	"github.com/instacryptio/icfx/identity"
 )
 
@@ -27,26 +35,46 @@ import (
 type VerifyStatus int
 
 const (
-	// VerifyUnsigned: the container carried no signature.
+	// VerifyUnsigned: the container carries no signature and claims none.
 	VerifyUnsigned VerifyStatus = iota
-	// VerifyOK: the signature matched a known signer (see VerifyResult for who).
+	// VerifyOK: the signature verified against a known signer (see
+	// VerifyResult for who) and binds the plaintext that was written.
 	VerifyOK
-	// VerifyUnverifiable: the container is signed, but no available key matched
-	// (unknown sender, or the signature did not verify).
-	VerifyUnverifiable
-	// VerifyNoMetadata: the container is signed but carries no recoverable
-	// sender metadata to verify against — a header-stripped pre-v2 (v1) file.
-	VerifyNoMetadata
+	// VerifyFailed: the container claims a signature that does not hold —
+	// a signer key was resolved but the signature or the plaintext does not
+	// match it, the signature was stripped or bolted on, an advisory header
+	// disagrees with the sealed metadata, or the container is a legacy layout
+	// whose signature scheme is no longer honoured. Treat as tampered.
+	VerifyFailed
+	// VerifyUnknownSigner: the container is signed by a fingerprint that
+	// matches no contact and not the unlocked identity, so the signature could
+	// not be checked. The sender may simply not be imported yet.
+	VerifyUnknownSigner
 )
+
+// String names the status for logs and fallthrough display arms.
+func (s VerifyStatus) String() string {
+	switch s {
+	case VerifyUnsigned:
+		return "unsigned"
+	case VerifyOK:
+		return "ok"
+	case VerifyFailed:
+		return "failed"
+	case VerifyUnknownSigner:
+		return "unknown-signer"
+	}
+	return fmt.Sprintf("VerifyStatus(%d)", int(s))
+}
 
 // VerifyResult is the structured verification outcome. Clients render it however
 // they like (styled terminal lines, a bridge JSON string, an exit code) — the
 // library composes no display text.
 type VerifyResult struct {
 	Status VerifyStatus
-	// SignerFP is the sender fingerprint taken from the AUTHENTICATED metadata
-	// (v2 inner metadata, or the v1 header). Set whenever the container names a
-	// signer, so callers can show it even on VerifyUnverifiable.
+	// SignerFP is the sender fingerprint from the SEALED metadata. Set whenever
+	// the container names a signer, so callers can show who it claims to be
+	// even on VerifyFailed / VerifyUnknownSigner.
 	SignerFP string
 	// SignerAlias is the matched contact's alias (set on VerifyOK via a contact).
 	SignerAlias string
@@ -64,112 +92,71 @@ type Result struct {
 	Verify    VerifyResult
 }
 
-// DecryptAndVerify parses an .icfx container, decrypts its payload with u, and
-// verifies any signature. See the package doc for the advisory-verification
-// contract. contactList may be nil/empty (verification then falls back to the
-// unlocked identity only).
-//
-// Verification always runs POST-decrypt against the AUTHENTICATED metadata: for
-// v2 that is the inner metadata sealed inside the payload (the plaintext header
-// is disposable and must never be trusted for signer selection); for v1 the
-// header is the only copy. The signer key is resolved in order: the sender's
-// current contact key, then that contact's previous/revoked keys, then the
-// unlocked identity itself (encrypt-to-self).
+// DecryptAndVerify is the in-memory form of DecryptAndVerifyStream: the whole
+// container is in data and the whole plaintext comes back in Result. See the
+// package doc for the verification contract.
 func DecryptAndVerify(data []byte, u *identity.Unlocked, contactList []contacts.Contact) (Result, error) {
-	container, err := format.Deserialize(data)
+	var out bytes.Buffer
+	verify, err := DecryptAndVerifyStream(bytes.NewReader(data), &out, u, contactList)
 	if err != nil {
-		return Result{}, fmt.Errorf("parsing ICFX container: %w", err)
+		return Result{}, err
 	}
-
-	plaintext, err := u.Decrypt(container.Payload)
-	if err != nil {
-		return Result{}, fmt.Errorf("decrypting payload: %w", err)
-	}
-
-	// Recover the authenticated metadata + the original file bytes. A private
-	// profile seals a metadata copy inside the payload; a public profile's
-	// payload is the bare file bytes, carrying metadata (if any) only in the
-	// plaintext header.
-	meta := container.Metadata
-	filedata := plaintext
-	if !container.Profile.Public() {
-		meta, filedata, err = format.DecodePayload(plaintext)
-		if err != nil {
-			return Result{}, fmt.Errorf("parsing inner metadata: %w", err)
-		}
-	}
-
-	// A header-stripped public container has no metadata anywhere: if it was
-	// signed the signature can't be checked; return the bytes with NoMetadata.
-	if container.Private && container.Profile.Public() {
-		status := VerifyUnsigned
-		if len(container.Signature) > 0 {
-			status = VerifyNoMetadata
-		}
-		return Result{Plaintext: filedata, Verify: VerifyResult{Status: status}}, nil
-	}
-
-	if !meta.IsSigned {
-		return Result{Plaintext: filedata, Verify: VerifyResult{Status: VerifyUnsigned}}, nil
-	}
-	// The AUTHENTICATED inner metadata says this container is signed, but the
-	// container carries no signature bytes — an active attacker stripped the
-	// outer signature. Report it as unverifiable (with the named signer), not as
-	// a clean "unsigned" file.
-	if len(container.Signature) == 0 {
-		return Result{Plaintext: filedata, Verify: VerifyResult{Status: VerifyUnverifiable, SignerFP: meta.SenderFingerprint}}, nil
-	}
-
-	res := verifySignature(container.Payload, container.Signature, meta.SenderFingerprint, u, contactList)
-	return Result{Plaintext: filedata, Verify: res}, nil
+	return Result{Plaintext: out.Bytes(), Verify: verify}, nil
 }
 
-// verifySignature resolves the signer's public key and checks the signature
-// (always taken over the encrypted payload). Search order: contact current key,
-// contact previous/revoked keys, then the unlocked identity itself.
-func verifySignature(payload, signature []byte, senderFP string, u *identity.Unlocked, contactList []contacts.Contact) VerifyResult {
-	// (a) current contact key by fingerprint.
+// verifySignature resolves the signer's public key for senderFP and checks
+// signature over message. Search order: every contact whose current key
+// carries the fingerprint (the store does not enforce uniqueness), then
+// contacts' previous/revoked keys, then the unlocked identity itself.
+// Fingerprints compare case-insensitively, as contacts.FindByFingerprint does.
+// A fingerprint that resolves to a usable key whose signature does not verify
+// is VerifyFailed; one that resolves to nothing usable is VerifyUnknownSigner
+// (an undecodable stored key says nothing about the file).
+func verifySignature(message, signature []byte, senderFP string, u *identity.Unlocked, contactList []contacts.Contact) VerifyResult {
+	if senderFP == "" {
+		return VerifyResult{Status: VerifyUnknownSigner}
+	}
+	resolved := false
+	verifies := func(encodedKey string) bool {
+		pub, err := base64.StdEncoding.DecodeString(encodedKey)
+		if err != nil {
+			return false
+		}
+		resolved = true
+		ok, verr := crypto.Verify(message, signature, pub)
+		return verr == nil && ok
+	}
+
+	// (a) current contact keys by fingerprint.
 	for _, c := range contactList {
-		if c.Fingerprint != senderFP {
-			continue
+		if strings.EqualFold(c.Fingerprint, senderFP) && verifies(c.SignPubKey) {
+			return VerifyResult{Status: VerifyOK, SignerFP: senderFP, SignerAlias: c.Alias}
 		}
-		if pub, err := base64.StdEncoding.DecodeString(c.SignPubKey); err == nil {
-			if ok, verr := crypto.Verify(payload, signature, pub); verr == nil && ok {
-				return VerifyResult{Status: VerifyOK, SignerFP: senderFP, SignerAlias: c.Alias}
-			}
-		}
-		break // fingerprint is unique; current key didn't verify — fall through to previous keys
 	}
 
 	// (b) previous/revoked contact keys — a signature made before the contact
 	// rotated stays valid, but is flagged.
 	for _, c := range contactList {
 		for _, prev := range c.PreviousKeys {
-			if prev.Fingerprint != senderFP {
-				continue
-			}
-			if pub, err := base64.StdEncoding.DecodeString(prev.SignPubKey); err == nil {
-				if ok, verr := crypto.Verify(payload, signature, pub); verr == nil && ok {
-					return VerifyResult{
-						Status:         VerifyOK,
-						SignerFP:       senderFP,
-						SignerAlias:    c.Alias,
-						UsedRevokedKey: true,
-						RevokedAt:      prev.RevokedAt,
-					}
+			if strings.EqualFold(prev.Fingerprint, senderFP) && verifies(prev.SignPubKey) {
+				return VerifyResult{
+					Status:         VerifyOK,
+					SignerFP:       senderFP,
+					SignerAlias:    c.Alias,
+					UsedRevokedKey: true,
+					RevokedAt:      prev.RevokedAt,
 				}
 			}
 		}
 	}
 
 	// (c) self — the file was signed by the identity we're decrypting with.
-	if u.Fingerprint() == senderFP {
-		if pub, err := base64.StdEncoding.DecodeString(u.Info().SignPubKey); err == nil {
-			if ok, verr := crypto.Verify(payload, signature, pub); verr == nil && ok {
-				return VerifyResult{Status: VerifyOK, SignerFP: senderFP, SignerIdentity: u.Name()}
-			}
-		}
+	if strings.EqualFold(u.Fingerprint(), senderFP) && verifies(u.Info().SignPubKey) {
+		return VerifyResult{Status: VerifyOK, SignerFP: senderFP, SignerIdentity: u.Name()}
 	}
 
-	return VerifyResult{Status: VerifyUnverifiable, SignerFP: senderFP}
+	if resolved {
+		return VerifyResult{Status: VerifyFailed, SignerFP: senderFP}
+	}
+	return VerifyResult{Status: VerifyUnknownSigner, SignerFP: senderFP}
 }
