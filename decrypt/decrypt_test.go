@@ -78,6 +78,22 @@ func newParty(t *testing.T, name string) *party {
 	if err != nil {
 		t.Fatalf("generating keypair: %v", err)
 	}
+	return unlockParty(t, name, kp, kp.Fingerprint)
+}
+
+// newPartyWithFingerprint is newParty with the identity's recorded fingerprint
+// replaced — for exercising a store whose metadata is wrong or missing.
+func newPartyWithFingerprint(t *testing.T, name, fingerprint string) *party {
+	t.Helper()
+	kp, err := crypto.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("generating keypair: %v", err)
+	}
+	return unlockParty(t, name, kp, fingerprint)
+}
+
+func unlockParty(t *testing.T, name string, kp *crypto.KeyPair, fingerprint string) *party {
+	t.Helper()
 	ks := newMemKeystore()
 	if err := ks.StoreEncryptionIdentity(name, kp.EncryptionIdentity); err != nil {
 		t.Fatal(err)
@@ -89,7 +105,7 @@ func newParty(t *testing.T, name string) *party {
 		Name:        name,
 		EncPubKey:   kp.EncryptionRecipient,
 		SignPubKey:  base64.StdEncoding.EncodeToString(kp.SigningPublicKey),
-		Fingerprint: kp.Fingerprint,
+		Fingerprint: fingerprint,
 		Status:      "active",
 	}
 	u, err := identity.Unlock(ks, info)

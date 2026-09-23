@@ -16,6 +16,7 @@ import (
 	"github.com/instacryptio/icfx/crypto"
 	"github.com/instacryptio/icfx/format"
 	"github.com/instacryptio/icfx/identity"
+	"github.com/instacryptio/icfx/validate"
 )
 
 // EncryptStream writes an .icfx container to dst: it stream-encrypts the
@@ -43,12 +44,19 @@ func EncryptStream(dst io.Writer, src io.Reader, recipients []string, signer *id
 		if signer == nil {
 			return fmt.Errorf("meta.IsSigned set but no signer provided")
 		}
+		// The sealed fingerprint is how recipients resolve the signer, so it
+		// must be the signer's and must be a real fingerprint — a container
+		// naming nobody could never verify.
+		fp := signer.Fingerprint()
+		if err := validate.ValidateFingerprint(fp); err != nil {
+			return fmt.Errorf("signer has no usable fingerprint: %w", err)
+		}
 		switch meta.SenderFingerprint {
 		case "":
-			meta.SenderFingerprint = signer.Fingerprint()
-		case signer.Fingerprint():
+			meta.SenderFingerprint = fp
+		case fp:
 		default:
-			return fmt.Errorf("meta.SenderFingerprint %q does not match the signer %q", meta.SenderFingerprint, signer.Fingerprint())
+			return fmt.Errorf("meta.SenderFingerprint %q does not match the signer %q", meta.SenderFingerprint, fp)
 		}
 	}
 	metaJSON, err := json.Marshal(meta)

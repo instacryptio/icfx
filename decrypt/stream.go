@@ -1,6 +1,7 @@
 package decrypt
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -11,7 +12,15 @@ import (
 	"github.com/instacryptio/icfx/crypto"
 	"github.com/instacryptio/icfx/format"
 	"github.com/instacryptio/icfx/identity"
+	"github.com/instacryptio/icfx/validate"
 )
+
+// maxLegacyBuffered caps how much of a legacy buffered container (profiles
+// 0x01/0x02, whole ciphertext in memory) is read. The profile byte is
+// attacker-controlled, so without a cap any oversized file could be steered
+// onto the buffered path and exhaust memory. Real legacy files are far below
+// this; the layout itself topped out at 4 GiB.
+var maxLegacyBuffered int64 = 512 << 20
 
 // DecryptAndVerifyStream decrypts the .icfx container in src to dst in constant
 // memory and verifies its signature. The plaintext is written regardless of
@@ -68,7 +77,7 @@ func decryptContainer(src io.ReadSeeker, dst io.Writer, u *identity.Unlocked, co
 	if err != nil {
 		return VerifyResult{}, fmt.Errorf("decrypting payload: %w", err)
 	}
-	meta, err := readInnerMeta(pr)
+	meta, sealedRaw, err := readInnerMeta(pr)
 	if err != nil {
 		return VerifyResult{}, fmt.Errorf("reading inner metadata: %w", err)
 	}
@@ -80,39 +89,59 @@ func decryptContainer(src io.ReadSeeker, dst io.Writer, u *identity.Unlocked, co
 	if _, err := io.Copy(ctDigest, payload); err != nil {
 		return VerifyResult{}, fmt.Errorf("hashing payload: %w", err)
 	}
-	return verdict(sh, meta, ptDigest.Sum(nil), ctDigest.Sum(nil), u, contactList), nil
+	return verdict(sh, meta, sealedRaw, ptDigest.Sum(nil), ctDigest.Sum(nil), u, contactList), nil
 }
 
 // verdict decides the VerifyResult for a decrypted container. The sealed
 // metadata is the only authority on whether the container is signed and by
 // whom; every inconsistency between it and what is on the wire is a failure.
-func verdict(sh *format.StreamHeader, meta format.Metadata, plaintextDigest, ciphertextDigest []byte, u *identity.Unlocked, contactList []contacts.Contact) VerifyResult {
+// A sealed sender fingerprint is reported only when it is well-formed — it is
+// a string the file's author chose, so nothing else may ever be shown as a
+// sender.
+func verdict(sh *format.StreamHeader, meta format.Metadata, sealedRaw, plaintextDigest, ciphertextDigest []byte, u *identity.Unlocked, contactList []contacts.Contact) VerifyResult {
+	claimed := claimedSigner(meta)
+	failed := VerifyResult{Status: VerifyFailed, SignerFP: claimed}
+	// The advisory header, when present, must be the sealed bytes verbatim —
+	// signed or not: the writer emits the same JSON in both places.
+	if !sh.Private && !bytes.Equal(sh.HeaderRaw, sealedRaw) {
+		return failed
+	}
 	if !meta.IsSigned {
 		if len(sh.Signature) > 0 {
 			// Nobody may bolt a signature onto a file its author left unsigned.
-			return VerifyResult{Status: VerifyFailed}
+			return failed
 		}
 		return VerifyResult{Status: VerifyUnsigned}
 	}
-	failed := VerifyResult{Status: VerifyFailed, SignerFP: meta.SenderFingerprint}
 	switch {
-	case meta.SenderFingerprint == "":
-		return failed // signed but names no signer: malformed
+	case claimed == "":
+		return failed // signed but names no well-formed signer: malformed
 	case len(sh.Signature) == 0:
 		return failed // signature stripped
-	case !sh.Private && !sh.HeaderMeta.Equal(meta):
-		return failed // advisory header disagrees with the sealed copy
 	}
-	return verifySignature(crypto.SignedMessage(byte(sh.Profile), plaintextDigest, ciphertextDigest), sh.Signature, meta.SenderFingerprint, u, contactList)
+	return verifySignature(crypto.SignedMessage(byte(sh.Profile), plaintextDigest, ciphertextDigest), sh.Signature, claimed, u, contactList)
+}
+
+// claimedSigner returns the sealed sender fingerprint if it has the shape of
+// a real fingerprint, else "" — so a malformed or hostile value is never
+// resolved against, reported, or displayed.
+func claimedSigner(meta format.Metadata) string {
+	if validate.ValidateFingerprint(meta.SenderFingerprint) != nil {
+		return ""
+	}
+	return meta.SenderFingerprint
 }
 
 // decryptLegacyBuffered decrypts a LegacyProfilePublicBuffered /
 // LegacyProfilePrivateBuffered container (uint32 payload length, whole
-// ciphertext in memory).
+// ciphertext in memory, bounded by maxLegacyBuffered).
 func decryptLegacyBuffered(src io.Reader, dst io.Writer, u *identity.Unlocked) (VerifyResult, error) {
-	data, err := io.ReadAll(src)
+	data, err := io.ReadAll(io.LimitReader(src, maxLegacyBuffered+1))
 	if err != nil {
 		return VerifyResult{}, err
+	}
+	if int64(len(data)) > maxLegacyBuffered {
+		return VerifyResult{}, fmt.Errorf("parsing ICFX container: legacy buffered container exceeds %d bytes: %w", maxLegacyBuffered, format.ErrInvalidFormat)
 	}
 	c, err := format.Deserialize(data)
 	if err != nil {
@@ -151,7 +180,7 @@ func decryptLegacyStreaming(src io.ReadSeeker, dst io.Writer, u *identity.Unlock
 	}
 	meta := sh.HeaderMeta
 	if sh.Profile.SealsMetadata() {
-		meta, err = readInnerMeta(pr)
+		meta, _, err = readInnerMeta(pr)
 		if err != nil {
 			return VerifyResult{}, fmt.Errorf("reading inner metadata: %w", err)
 		}
@@ -164,31 +193,33 @@ func decryptLegacyStreaming(src io.ReadSeeker, dst io.Writer, u *identity.Unlock
 
 // legacyVerdict: legacy signatures bound only the ciphertext and are no longer
 // honoured, so anything that claims to be signed fails. The claimed signer
-// fingerprint (if the layout carried one) is reported so the caller can say
-// who the file said it was from.
+// fingerprint (if the layout carried a well-formed one) is reported so the
+// caller can say who the file said it was from.
 func legacyVerdict(meta format.Metadata, signature []byte) VerifyResult {
 	if !meta.IsSigned && len(signature) == 0 {
 		return VerifyResult{Status: VerifyUnsigned}
 	}
-	return VerifyResult{Status: VerifyFailed, SignerFP: meta.SenderFingerprint}
+	return VerifyResult{Status: VerifyFailed, SignerFP: claimedSigner(meta)}
 }
 
 // readInnerMeta reads the uint16-length-prefixed inner metadata off the front of
-// a decrypted payload stream, leaving r positioned at the file bytes.
-func readInnerMeta(r io.Reader) (format.Metadata, error) {
+// a decrypted payload stream, leaving r positioned at the file bytes. It returns
+// the parsed metadata and the raw JSON bytes (for byte-exact comparison with an
+// advisory header).
+func readInnerMeta(r io.Reader) (format.Metadata, []byte, error) {
 	var lenbuf [2]byte
 	if _, err := io.ReadFull(r, lenbuf[:]); err != nil {
-		return format.Metadata{}, err
+		return format.Metadata{}, nil, err
 	}
 	mbuf := make([]byte, int(binary.BigEndian.Uint16(lenbuf[:])))
 	if _, err := io.ReadFull(r, mbuf); err != nil {
-		return format.Metadata{}, err
+		return format.Metadata{}, nil, err
 	}
 	var meta format.Metadata
 	if err := json.Unmarshal(mbuf, &meta); err != nil {
-		return format.Metadata{}, err
+		return format.Metadata{}, nil, err
 	}
-	return meta, nil
+	return meta, mbuf, nil
 }
 
 // decryptToWriter dispatches a container (ICFX magic) vs a bare-age file, both
@@ -228,11 +259,16 @@ func DecryptFile(inPath, outPath string, u *identity.Unlocked, contactList []con
 		return VerifyResult{}, err
 	}
 
-	// 0600: decrypted plaintext may be sensitive; don't leave it world-readable
-	// (os.Create would use 0666 & umask, typically 0644).
+	// 0600: decrypted plaintext may be sensitive; don't leave it world-readable.
+	// The mode in OpenFile only applies when the file is created, so an
+	// existing outPath is tightened explicitly.
 	out, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return VerifyResult{}, err
+	}
+	if err := out.Chmod(0600); err != nil {
+		out.Close()
+		return VerifyResult{}, fmt.Errorf("restricting output permissions: %w", err)
 	}
 
 	verify, decErr := decryptToWriter(string(magic) == string(format.MagicBytes), in, out, u, contactList)

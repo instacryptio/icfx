@@ -105,8 +105,9 @@ func SendEncryptedProgress(ctx context.Context, c *cloud.Client, to []Recipient,
 
 	// Streaming header strip: replace the fixed prefix with a zero-length
 	// header marker and skip the plaintext metadata block; payload and
-	// signature bytes stream through untouched (the signature covers only
-	// the payload, so it stays valid).
+	// signature bytes stream through untouched. The signature never covers
+	// the header (it binds the profile, the plaintext and the ciphertext), and
+	// the metadata it needs is sealed inside the payload, so it stays valid.
 	head := make([]byte, format.HeaderPrefixLen)
 	if _, err := io.ReadFull(f, head); err != nil {
 		return SendResult{}, fmt.Errorf("reading container header: %w", err)

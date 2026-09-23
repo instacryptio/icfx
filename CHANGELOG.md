@@ -4,6 +4,7 @@
 **v0.1.7 - 09-24-2026**
 
 - icfx container signing/verification refactor and hardening
+- Hardware keys: all hidapi calls run on one OS-locked worker thread
 
 
 **v0.1.6 - 09-11-2026**

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -221,6 +222,26 @@ func TestParseStreamHeader(t *testing.T) {
 
 	if _, err := ParseStreamHeader(bytes.NewReader(legacyBuffered(t, LegacyProfilePrivateBuffered, nil, payload, nil))); !errors.Is(err, ErrUnsupportedProfile) {
 		t.Fatalf("buffered layout through ParseStreamHeader: want ErrUnsupportedProfile, got %v", err)
+	}
+}
+
+func TestParseStreamHeaderRejectsHostileLengths(t *testing.T) {
+	meta := testMeta()
+	data := streaming(t, ProfilePublic, &meta, []byte("short payload"), nil)
+	sh, err := ParseStreamHeader(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lenOff := sh.PayloadStart - 8
+	for _, claimed := range []uint64{math.MaxUint64, math.MaxInt64, math.MaxInt64 - 1, 1 << 40} {
+		hostile := append([]byte{}, data...)
+		binary.BigEndian.PutUint64(hostile[lenOff:lenOff+8], claimed)
+		if _, err := ParseStreamHeader(bytes.NewReader(hostile)); err == nil {
+			t.Fatalf("PayloadLen %d must be rejected", claimed)
+		}
+	}
+	if !bytes.Equal(sh.HeaderRaw, data[HeaderPrefixLen:HeaderPrefixLen+len(sh.HeaderRaw)]) {
+		t.Fatal("HeaderRaw must be the header bytes verbatim")
 	}
 }
 

@@ -69,16 +69,64 @@ const (
 var (
 	hidInitOnce sync.Once
 	hidInitErr  error
-	// hidMu serializes device access. A YubiKey's OTP state machine (the
-	// SLOT_WRITE_FLAG / RESP_PENDING flags + sequence counter) is global to the
-	// physical key, so two concurrent in-process operations would interleave and
-	// corrupt each other's frames.
-	hidMu sync.Mutex
+	// hidJobs feeds the single HID worker thread (see hidRun); hidWorkerOnce
+	// starts it on first use.
+	hidJobs       chan func()
+	hidWorkerOnce sync.Once
 )
+
+// hidRun executes fn on the HID worker: one goroutine locked to an OS thread
+// for the life of the process, through which EVERY hidapi call goes — init,
+// enumerate, open, each feature report, close.
+//
+// hidapi's macOS backend schedules its process-global IOHIDManager on the run
+// loop of the thread that initialized it, and enumeration pumps the CALLING
+// thread's run loop before copying the device set. Calls made from unpinned
+// goroutines land on whatever OS thread the scheduler picked, so an
+// enumeration on a thread other than the initializing one services none of
+// the manager's sources and comes back empty — a long-lived GUI on an Intel
+// Mac reported "no hardware key" with no error for exactly this reason.
+// Confining every call to one pinned thread removes the affinity problem
+// outright, and keeps IOKit's mach calls clear of Go's async preemption too.
+// The other backends (hidraw, HID.dll) have no thread affinity; the worker is
+// harmless there.
+//
+// Jobs run strictly one at a time. That is also what keeps a YubiKey's OTP
+// state machine (SLOT_WRITE_FLAG / RESP_PENDING + sequence counter, global to
+// the physical key) consistent: a whole challenge or status read is one job,
+// so two in-process operations can never interleave their frames. The cost
+// is that a touch-wait (up to touchTimeout) delays a concurrent enumeration
+// behind it — one device, one thread.
+//
+// fn must not call hidRun itself (the worker would wait on itself); the
+// *Locked helpers exist for calls made from inside a job.
+func hidRun(fn func() error) error {
+	hidWorkerOnce.Do(func() {
+		hidJobs = make(chan func())
+		go func() {
+			runtime.LockOSThread() // never unlocked: this thread belongs to hidapi
+			for job := range hidJobs {
+				job()
+			}
+		}()
+	})
+	done := make(chan error, 1)
+	hidJobs <- func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- fmt.Errorf("chalresp: hid worker panic: %v", r)
+			}
+		}()
+		done <- fn()
+	}
+	return <-done
+}
 
 // hidEnsureInit initializes hidapi once for the process lifetime. hidapi is
 // otherwise lazily initialized; we do it explicitly for concurrency safety and
 // never call hid.Exit (the OS reclaims on exit), matching the old ykpers path.
+// Only ever runs inside a hidRun job, so the IOHIDManager is scheduled on the
+// worker thread's run loop — the one every later call pumps.
 func hidEnsureInit() error {
 	hidInitOnce.Do(func() {
 		if err := hid.Init(); err != nil {
@@ -99,6 +147,18 @@ func hidEnsureInit() error {
 // hidList enumerates connected devices that expose the YubiKey OTP keyboard
 // interface. Returns an empty slice (not an error) when none are present.
 func hidList() ([]DeviceDescriptor, error) {
+	var out []DeviceDescriptor
+	err := hidRun(func() error {
+		devs, err := hidListLocked()
+		out = devs
+		return err
+	})
+	return out, err
+}
+
+// hidListLocked is hidList's body, for use ON the HID worker thread only
+// (inside a hidRun job).
+func hidListLocked() ([]DeviceDescriptor, error) {
 	if err := hidEnsureInit(); err != nil {
 		return nil, err
 	}
@@ -137,8 +197,6 @@ func hidList() ([]DeviceDescriptor, error) {
 
 // hidIsSlot2Programmed reads the device status report and checks CONFIG2_VALID.
 func hidIsSlot2Programmed(desc DeviceDescriptor) (bool, error) {
-	hidMu.Lock()
-	defer hidMu.Unlock()
 	var programmed bool
 	err := withDevice(desc, func(dev *hid.Device) error {
 		st, err := readStatus(dev)
@@ -154,8 +212,6 @@ func hidIsSlot2Programmed(desc DeviceDescriptor) (bool, error) {
 // hidChallenge runs a slot-2 HMAC-SHA1 challenge-response. mayBlock=true waits
 // for a physical touch on slots configured to require one.
 func hidChallenge(desc DeviceDescriptor, challenge []byte, mayBlock bool) ([]byte, error) {
-	hidMu.Lock()
-	defer hidMu.Unlock()
 	var resp []byte
 	err := withDevice(desc, func(dev *hid.Device) error {
 		frame := buildFrame(challenge, slotChalHMAC2)
@@ -176,23 +232,21 @@ func hidChallenge(desc DeviceDescriptor, challenge []byte, mayBlock bool) ([]byt
 }
 
 // withDevice opens the device (by its enumerated path, or the first available
-// one if the descriptor carries none), runs fn, and closes it.
+// one if the descriptor carries none), runs fn, and closes it — all on the HID
+// worker thread, so fn's feature-report I/O never crosses threads.
 func withDevice(desc DeviceDescriptor, fn func(*hid.Device) error) error {
-	// Pin this goroutine to its OS thread for the whole device interaction. On
-	// macOS, IOKit's IOHIDDeviceGetReport/SetReport do mach calls that Go's async
-	// preemption (SIGURG, Go 1.14+) can interrupt, surfacing as a transient
-	// kIOReturnError (0xE00002BC) — the report backends (hidraw/HID.dll) are
-	// unaffected, but LockOSThread is harmless there. Keeping every open + feature
-	// report + close on one thread eliminates the interruption. (See go-hid #15.)
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+	return hidRun(func() error { return withDeviceLocked(desc, fn) })
+}
 
+// withDeviceLocked is withDevice's body, for use ON the HID worker thread only
+// (inside a hidRun job).
+func withDeviceLocked(desc DeviceDescriptor, fn func(*hid.Device) error) error {
 	if err := hidEnsureInit(); err != nil {
 		return err
 	}
 	path := desc.path
 	if path == "" {
-		devs, err := hidList()
+		devs, err := hidListLocked()
 		if err != nil {
 			return err
 		}

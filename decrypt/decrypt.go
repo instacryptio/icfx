@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/instacryptio/icfx/contacts"
@@ -104,57 +105,54 @@ func DecryptAndVerify(data []byte, u *identity.Unlocked, contactList []contacts.
 }
 
 // verifySignature resolves the signer's public key for senderFP and checks
-// signature over message. Search order: contact current key, contact
-// previous/revoked keys, then the unlocked identity itself. A fingerprint that
-// resolves to a key but whose signature does not verify is VerifyFailed; a
-// fingerprint that resolves to nothing is VerifyUnknownSigner.
+// signature over message. Search order: every contact whose current key
+// carries the fingerprint (the store does not enforce uniqueness), then
+// contacts' previous/revoked keys, then the unlocked identity itself.
+// Fingerprints compare case-insensitively, as contacts.FindByFingerprint does.
+// A fingerprint that resolves to a usable key whose signature does not verify
+// is VerifyFailed; one that resolves to nothing usable is VerifyUnknownSigner
+// (an undecodable stored key says nothing about the file).
 func verifySignature(message, signature []byte, senderFP string, u *identity.Unlocked, contactList []contacts.Contact) VerifyResult {
+	if senderFP == "" {
+		return VerifyResult{Status: VerifyUnknownSigner}
+	}
 	resolved := false
-
-	// (a) current contact key by fingerprint.
-	for _, c := range contactList {
-		if c.Fingerprint != senderFP {
-			continue
+	verifies := func(encodedKey string) bool {
+		pub, err := base64.StdEncoding.DecodeString(encodedKey)
+		if err != nil {
+			return false
 		}
 		resolved = true
-		if pub, err := base64.StdEncoding.DecodeString(c.SignPubKey); err == nil {
-			if ok, verr := crypto.Verify(message, signature, pub); verr == nil && ok {
-				return VerifyResult{Status: VerifyOK, SignerFP: senderFP, SignerAlias: c.Alias}
-			}
+		ok, verr := crypto.Verify(message, signature, pub)
+		return verr == nil && ok
+	}
+
+	// (a) current contact keys by fingerprint.
+	for _, c := range contactList {
+		if strings.EqualFold(c.Fingerprint, senderFP) && verifies(c.SignPubKey) {
+			return VerifyResult{Status: VerifyOK, SignerFP: senderFP, SignerAlias: c.Alias}
 		}
-		break // fingerprint is unique; current key didn't verify — fall through to previous keys
 	}
 
 	// (b) previous/revoked contact keys — a signature made before the contact
 	// rotated stays valid, but is flagged.
 	for _, c := range contactList {
 		for _, prev := range c.PreviousKeys {
-			if prev.Fingerprint != senderFP {
-				continue
-			}
-			resolved = true
-			if pub, err := base64.StdEncoding.DecodeString(prev.SignPubKey); err == nil {
-				if ok, verr := crypto.Verify(message, signature, pub); verr == nil && ok {
-					return VerifyResult{
-						Status:         VerifyOK,
-						SignerFP:       senderFP,
-						SignerAlias:    c.Alias,
-						UsedRevokedKey: true,
-						RevokedAt:      prev.RevokedAt,
-					}
+			if strings.EqualFold(prev.Fingerprint, senderFP) && verifies(prev.SignPubKey) {
+				return VerifyResult{
+					Status:         VerifyOK,
+					SignerFP:       senderFP,
+					SignerAlias:    c.Alias,
+					UsedRevokedKey: true,
+					RevokedAt:      prev.RevokedAt,
 				}
 			}
 		}
 	}
 
 	// (c) self — the file was signed by the identity we're decrypting with.
-	if u.Fingerprint() == senderFP {
-		resolved = true
-		if pub, err := base64.StdEncoding.DecodeString(u.Info().SignPubKey); err == nil {
-			if ok, verr := crypto.Verify(message, signature, pub); verr == nil && ok {
-				return VerifyResult{Status: VerifyOK, SignerFP: senderFP, SignerIdentity: u.Name()}
-			}
-		}
+	if strings.EqualFold(u.Fingerprint(), senderFP) && verifies(u.Info().SignPubKey) {
+		return VerifyResult{Status: VerifyOK, SignerFP: senderFP, SignerIdentity: u.Name()}
 	}
 
 	if resolved {

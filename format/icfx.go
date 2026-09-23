@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"time"
 )
 
@@ -175,9 +176,10 @@ func Deserialize(data []byte) (*Container, error) {
 		return nil, ErrInvalidFormat
 	}
 
+	// Payload and signature are sub-slices of data (no second copy of a
+	// possibly large payload); callers own data and do not mutate it.
 	plen := int(payloadLen)
-	payload := make([]byte, plen)
-	copy(payload, data[offset:offset+plen])
+	payload := data[offset : offset+plen]
 	offset += plen
 
 	sigLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
@@ -188,8 +190,7 @@ func Deserialize(data []byte) (*Container, error) {
 		if len(data) < offset+sigLen {
 			return nil, ErrInvalidFormat
 		}
-		signature = make([]byte, sigLen)
-		copy(signature, data[offset:offset+sigLen])
+		signature = data[offset : offset+sigLen]
 	}
 
 	return &Container{
@@ -273,12 +274,17 @@ func ZeroMetaLen(head []byte) {
 // signature without reading the (potentially huge) payload — the input for a
 // constant-memory decrypt.
 type StreamHeader struct {
-	Profile      Profile
-	Private      bool     // no plaintext header block (metaLen 0)
-	HeaderMeta   Metadata // populated only when a plaintext header is present
-	PayloadStart int64    // byte offset of the age payload within the container
-	PayloadLen   int64    // uint64 on the wire
-	Signature    []byte   // ML-DSA-65 signature (nil when absent)
+	Profile Profile
+	Private bool // no plaintext header block (metaLen 0)
+	// HeaderMeta / HeaderRaw are the plaintext header block, present only on
+	// public profiles. They are NOT authenticated: anyone can rewrite them.
+	// Never resolve a signer or name a sender from them; the copy sealed
+	// inside the payload is the authority and decrypt compares the two.
+	HeaderMeta   Metadata
+	HeaderRaw    []byte
+	PayloadStart int64  // byte offset of the age payload within the container
+	PayloadLen   int64  // uint64 on the wire
+	Signature    []byte // ML-DSA-65 signature (nil when absent)
 }
 
 // ParseStreamHeader reads a streaming container's framing from r (seeking as
@@ -306,16 +312,20 @@ func ParseStreamHeader(r io.ReadSeeker) (*StreamHeader, error) {
 		if err := json.Unmarshal(mbuf, &sh.HeaderMeta); err != nil {
 			return nil, fmt.Errorf("parsing header metadata: %w", err)
 		}
+		sh.HeaderRaw = mbuf
 	}
 	var plbuf [8]byte
 	if _, err := io.ReadFull(r, plbuf[:]); err != nil {
 		return nil, fmt.Errorf("reading payload length: %w", err)
 	}
+	sh.PayloadStart = int64(HeaderPrefixLen + metaLen + 8)
+	// The length is attacker-controlled: reject anything that cannot fit in
+	// an int64 offset (plus the trailing signature-length field) rather than
+	// relying on the reader to refuse a wrapped-around seek.
 	sh.PayloadLen = int64(binary.BigEndian.Uint64(plbuf[:]))
-	if sh.PayloadLen < 0 {
+	if sh.PayloadLen < 0 || sh.PayloadLen > math.MaxInt64-sh.PayloadStart-2 {
 		return nil, ErrInvalidFormat
 	}
-	sh.PayloadStart = int64(HeaderPrefixLen + metaLen + 8)
 	// The signature length + bytes follow the payload.
 	if _, err := r.Seek(sh.PayloadStart+sh.PayloadLen, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("seeking to signature: %w", err)

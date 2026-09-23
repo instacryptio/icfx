@@ -6,6 +6,10 @@ import (
 	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 )
 
+// SigningPublicKeySize is the byte length of an ML-DSA-65 public key — the
+// only shape a raw lock passed to Verify can have.
+const SigningPublicKeySize = mldsa65.PublicKeySize
+
 // Verify checks an ML-DSA-65 (FIPS 204) signature against the given data and public key.
 func Verify(data []byte, signature []byte, publicKey []byte) (bool, error) {
 	pubKey := new(mldsa65.PublicKey)
